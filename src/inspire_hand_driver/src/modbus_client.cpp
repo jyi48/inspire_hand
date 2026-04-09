@@ -29,6 +29,11 @@ ModbusClient::~ModbusClient()
 
 void ModbusClient::connect()
 {
+  // 재연결 시 기존 소켓 먼저 닫기
+  if (connected_) {
+    modbus_close(ctx_);
+    connected_ = false;
+  }
   if (modbus_connect(ctx_) == -1) {
     throw std::runtime_error(
       "Modbus connect failed (" + ip_ + "): " + modbus_strerror(errno));

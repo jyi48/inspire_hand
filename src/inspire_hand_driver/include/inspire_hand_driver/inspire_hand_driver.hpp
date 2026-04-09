@@ -48,8 +48,8 @@ private:
   // 각 손별 상태
   struct Hand {
     HandConfig config;
-    std::unique_ptr<ModbusClient> modbus;
-    std::mutex write_mutex;
+    std::unique_ptr<ModbusClient> modbus_write;  // ctrl 전용
+    std::unique_ptr<ModbusClient> modbus_read;   // state 전용
 
     rclcpp::Time last_ctrl_time_{0, 0, RCL_ROS_TIME};
 

@@ -13,13 +13,14 @@ namespace inspire_hand_driver
 InspireHandDriver::InspireHandDriver(const rclcpp::NodeOptions & options)
 : Node("inspire_hand_driver", options)
 {
-  // 파라미터 선언 (기본값 포함)
-  this->declare_parameter("right_ip",     "192.168.123.210");
-  this->declare_parameter("left_ip",      "192.168.123.211");
-  this->declare_parameter("modbus_port",  6000);
-  this->declare_parameter("device_id",    1);
-  this->declare_parameter("state_hz",     50.0);
-  this->declare_parameter("ctrl_hz",      50.0);
+  this->declare_parameter("right_ip",    "192.168.123.210");
+  this->declare_parameter("left_ip",     "192.168.123.211");
+  this->declare_parameter("modbus_port", 6000);
+  this->declare_parameter("device_id",   1);
+  this->declare_parameter("state_hz",    50.0);
+  this->declare_parameter("ctrl_hz",     50.0);
+
+  ctrl_min_interval_s_ = 1.0 / this->get_parameter("ctrl_hz").as_double();
 
   right_.config = {
     this->get_parameter("right_ip").as_string(),
@@ -33,8 +34,6 @@ InspireHandDriver::InspireHandDriver(const rclcpp::NodeOptions & options)
     static_cast<int>(this->get_parameter("modbus_port").as_int()),
     static_cast<int>(this->get_parameter("device_id").as_int())
   };
-
-  ctrl_min_interval_s_ = 1.0 / this->get_parameter("ctrl_hz").as_double();
 
   init_hand(right_);
   init_hand(left_);
@@ -50,31 +49,41 @@ InspireHandDriver::InspireHandDriver(const rclcpp::NodeOptions & options)
 
   RCLCPP_INFO(get_logger(),
     "InspireHandDriver started — right:%s left:%s state:%.0fHz ctrl:%.0fHz",
-    right_.config.ip.c_str(), left_.config.ip.c_str(), state_hz,
-    1.0 / ctrl_min_interval_s_);
+    right_.config.ip.c_str(), left_.config.ip.c_str(),
+    state_hz, 1.0 / ctrl_min_interval_s_);
 }
 
-InspireHandDriver::~InspireHandDriver()
+InspireHandDriver::~InspireHandDriver() {}
+
+// ──────────────────────────────────────────────
+// 내부 헬퍼: Modbus 연결 생성 + connect
+// ──────────────────────────────────────────────
+static std::unique_ptr<ModbusClient> make_modbus(const HandConfig & cfg, const std::string & label,
+  rclcpp::Logger logger)
 {
-  // ModbusClient 소멸자에서 disconnect
+  auto mb = std::make_unique<ModbusClient>(cfg.ip, cfg.port, cfg.device_id);
+  try {
+    mb->connect();
+    RCLCPP_INFO(logger, "[%s][%s] Modbus connected: %s:%d",
+      cfg.side.c_str(), label.c_str(), cfg.ip.c_str(), cfg.port);
+  } catch (const std::exception & e) {
+    RCLCPP_ERROR(logger, "[%s][%s] connect failed: %s",
+      cfg.side.c_str(), label.c_str(), e.what());
+  }
+  return mb;
 }
 
 void InspireHandDriver::init_hand(Hand & hand)
 {
-  try {
-    hand.modbus = std::make_unique<ModbusClient>(
-      hand.config.ip, hand.config.port, hand.config.device_id);
-    hand.modbus->connect();
+  hand.modbus_write = make_modbus(hand.config, "write", get_logger());
+  hand.modbus_read  = make_modbus(hand.config, "read",  get_logger());
 
-    // 에러 초기화
-    std::vector<int16_t> reset_val = {1};
-    hand.modbus->write_registers(reg::RESET_ERR, reset_val);
-
-    RCLCPP_INFO(get_logger(), "[%s] Modbus connected: %s:%d",
-      hand.config.side.c_str(), hand.config.ip.c_str(), hand.config.port);
-  } catch (const std::exception & e) {
-    RCLCPP_ERROR(get_logger(), "[%s] Modbus init failed: %s — 재시도 없이 계속",
-      hand.config.side.c_str(), e.what());
+  // 에러 초기화 (write 연결로)
+  if (hand.modbus_write->is_connected()) {
+    try {
+      std::vector<int16_t> reset_val = {1};
+      hand.modbus_write->write_registers(reg::RESET_ERR, reset_val);
+    } catch (...) {}
   }
 
   // ctrl subscriber
@@ -92,6 +101,9 @@ void InspireHandDriver::init_hand(Hand & hand)
   RCLCPP_INFO(get_logger(), "[%s] sub: %s", hand.config.side.c_str(), ctrl_topic.c_str());
 }
 
+// ──────────────────────────────────────────────
+// ctrl callback — write 전용 연결 사용
+// ──────────────────────────────────────────────
 void InspireHandDriver::ctrl_callback(
   Hand & hand,
   const InspireHandCtrl::SharedPtr msg)
@@ -103,35 +115,35 @@ void InspireHandDriver::ctrl_callback(
   }
   hand.last_ctrl_time_ = now;
 
-  if (!hand.modbus || !hand.modbus->is_connected()) {
+  // reconnect if needed
+  if (!hand.modbus_write->is_connected()) {
     try {
-      hand.modbus->disconnect();  // close 먼저
-      hand.modbus->connect();
+      hand.modbus_write->disconnect();
+      hand.modbus_write->connect();
     } catch (const std::exception & e) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "[%s] reconnect failed: %s", hand.config.side.c_str(), e.what());
+        "[%s] write reconnect failed: %s", hand.config.side.c_str(), e.what());
       return;
     }
   }
 
-  std::vector<int16_t> vals(msg->angle_set.begin(), msg->angle_set.end());
+  std::vector<int16_t> angle_vals(msg->angle_set.begin(), msg->angle_set.end());
   std::vector<int16_t> pos_vals(msg->pos_set.begin(), msg->pos_set.end());
   std::vector<int16_t> force_vals(msg->force_set.begin(), msg->force_set.end());
   std::vector<int16_t> speed_vals(msg->speed_set.begin(), msg->speed_set.end());
 
-  std::lock_guard<std::mutex> lock(hand.write_mutex);
   try {
-    if (msg->mode & 0b0001) {  // 각도 모드
-      hand.modbus->write_registers(reg::ANGLE_SET, vals);
+    if (msg->mode & 0b0001) {
+      hand.modbus_write->write_registers(reg::ANGLE_SET, angle_vals);
     }
-    if (msg->mode & 0b0010) {  // 위치 모드
-      hand.modbus->write_registers(reg::POS_SET, pos_vals);
+    if (msg->mode & 0b0010) {
+      hand.modbus_write->write_registers(reg::POS_SET, pos_vals);
     }
-    if (msg->mode & 0b0100) {  // 력 모드
-      hand.modbus->write_registers(reg::FORCE_SET, force_vals);
+    if (msg->mode & 0b0100) {
+      hand.modbus_write->write_registers(reg::FORCE_SET, force_vals);
     }
-    if (msg->mode & 0b1000) {  // 속도 모드
-      hand.modbus->write_registers(reg::SPEED_SET, speed_vals);
+    if (msg->mode & 0b1000) {
+      hand.modbus_write->write_registers(reg::SPEED_SET, speed_vals);
     }
   } catch (const std::exception & e) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
@@ -139,23 +151,32 @@ void InspireHandDriver::ctrl_callback(
   }
 }
 
+// ──────────────────────────────────────────────
+// state read timer — read 전용 연결 사용
+// ──────────────────────────────────────────────
 void InspireHandDriver::read_and_publish_state(Hand & hand)
 {
-  if (!hand.modbus || !hand.modbus->is_connected()) {
-    return;
+  // reconnect if needed
+  if (!hand.modbus_read->is_connected()) {
+    try {
+      hand.modbus_read->disconnect();
+      hand.modbus_read->connect();
+    } catch (const std::exception & e) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "[%s] read reconnect failed: %s", hand.config.side.c_str(), e.what());
+      return;
+    }
   }
 
   InspireHandState state_msg;
-
-  std::lock_guard<std::mutex> lock(hand.write_mutex);
   try {
-    auto pos_act   = hand.modbus->read_registers_short(reg::POS_ACT,   6);
-    auto angle_act = hand.modbus->read_registers_short(reg::ANGLE_ACT, 6);
-    auto force_act = hand.modbus->read_registers_short(reg::FORCE_ACT, 6);
-    auto current   = hand.modbus->read_registers_short(reg::CURRENT,   6);
-    auto err       = hand.modbus->read_registers_byte(reg::ERR,     3);  // 6 bytes
-    auto status    = hand.modbus->read_registers_byte(reg::STATUS,  3);
-    auto temp      = hand.modbus->read_registers_byte(reg::TEMP,    3);
+    auto pos_act   = hand.modbus_read->read_registers_short(reg::POS_ACT,   6);
+    auto angle_act = hand.modbus_read->read_registers_short(reg::ANGLE_ACT, 6);
+    auto force_act = hand.modbus_read->read_registers_short(reg::FORCE_ACT, 6);
+    auto current   = hand.modbus_read->read_registers_short(reg::CURRENT,   6);
+    auto err       = hand.modbus_read->read_registers_byte(reg::ERR,    3);
+    auto status    = hand.modbus_read->read_registers_byte(reg::STATUS, 3);
+    auto temp      = hand.modbus_read->read_registers_byte(reg::TEMP,   3);
 
     for (int i = 0; i < 6; ++i) {
       state_msg.pos_act[i]   = pos_act[i];
