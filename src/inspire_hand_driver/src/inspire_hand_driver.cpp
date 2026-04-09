@@ -19,19 +19,22 @@ InspireHandDriver::InspireHandDriver(const rclcpp::NodeOptions & options)
   this->declare_parameter("modbus_port",  6000);
   this->declare_parameter("device_id",    1);
   this->declare_parameter("state_hz",     50.0);
+  this->declare_parameter("ctrl_hz",      50.0);
 
   right_.config = {
     this->get_parameter("right_ip").as_string(),
     "r",
-    this->get_parameter("modbus_port").as_int(),
-    this->get_parameter("device_id").as_int()
+    static_cast<int>(this->get_parameter("modbus_port").as_int()),
+    static_cast<int>(this->get_parameter("device_id").as_int())
   };
   left_.config = {
     this->get_parameter("left_ip").as_string(),
     "l",
-    this->get_parameter("modbus_port").as_int(),
-    this->get_parameter("device_id").as_int()
+    static_cast<int>(this->get_parameter("modbus_port").as_int()),
+    static_cast<int>(this->get_parameter("device_id").as_int())
   };
+
+  ctrl_min_interval_s_ = 1.0 / this->get_parameter("ctrl_hz").as_double();
 
   init_hand(right_);
   init_hand(left_);
@@ -46,8 +49,9 @@ InspireHandDriver::InspireHandDriver(const rclcpp::NodeOptions & options)
     });
 
   RCLCPP_INFO(get_logger(),
-    "InspireHandDriver started — right:%s left:%s state:%.0fHz",
-    right_.config.ip.c_str(), left_.config.ip.c_str(), state_hz);
+    "InspireHandDriver started — right:%s left:%s state:%.0fHz ctrl:%.0fHz",
+    right_.config.ip.c_str(), left_.config.ip.c_str(), state_hz,
+    1.0 / ctrl_min_interval_s_);
 }
 
 InspireHandDriver::~InspireHandDriver()
@@ -92,9 +96,16 @@ void InspireHandDriver::ctrl_callback(
   Hand & hand,
   const InspireHandCtrl::SharedPtr msg)
 {
+  // rate limiting
+  auto now = this->now();
+  if ((now - hand.last_ctrl_time_).seconds() < ctrl_min_interval_s_) {
+    return;
+  }
+  hand.last_ctrl_time_ = now;
+
   if (!hand.modbus || !hand.modbus->is_connected()) {
-    // 연결 안됐을 때 재연결 시도
     try {
+      hand.modbus->disconnect();  // close 먼저
       hand.modbus->connect();
     } catch (const std::exception & e) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,

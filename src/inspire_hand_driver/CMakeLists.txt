@@ -13,9 +13,19 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(inspire_hand_msgs REQUIRED)
 
-# libmodbus
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(MODBUS REQUIRED libmodbus)
+# libmodbus — PkgConfig 있으면 우선 사용, 없으면 find_library fallback
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(MODBUS libmodbus)
+endif()
+
+if(NOT MODBUS_FOUND)
+  find_library(MODBUS_LIBRARIES NAMES modbus REQUIRED)
+  find_path(MODBUS_INCLUDE_DIRS NAMES modbus.h PATH_SUFFIXES modbus REQUIRED)
+  message(STATUS "libmodbus found via find_library: ${MODBUS_LIBRARIES}")
+else()
+  message(STATUS "libmodbus found via pkg-config: ${MODBUS_LIBRARIES}")
+endif()
 
 add_executable(inspire_hand_driver
   src/modbus_client.cpp

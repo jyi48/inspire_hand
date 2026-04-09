@@ -49,7 +49,9 @@ private:
   struct Hand {
     HandConfig config;
     std::unique_ptr<ModbusClient> modbus;
-    std::mutex write_mutex;  // write 전용 (read와 분리)
+    std::mutex write_mutex;
+
+    rclcpp::Time last_ctrl_time_{0, 0, RCL_ROS_TIME};
 
     rclcpp::Subscription<inspire_hand_msgs::msg::InspireHandCtrl>::SharedPtr sub;
     rclcpp::Publisher<inspire_hand_msgs::msg::InspireHandState>::SharedPtr state_pub;
@@ -57,6 +59,8 @@ private:
 
   Hand left_;
   Hand right_;
+
+  double ctrl_min_interval_s_{0.02};  // 1/ctrl_hz
 
   rclcpp::TimerBase::SharedPtr state_timer_;
 
