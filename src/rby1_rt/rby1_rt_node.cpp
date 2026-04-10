@@ -387,9 +387,9 @@ class Rby1RtNode : public rclcpp::Node {
           cbc.SetBodyCommand(bc).SetMobilityCommand(mc);
           rc.SetCommand(cbc);
         } else {
-          // Hold: use target_position (smoother than encoder reading)
+          // Hold: use current encoder position (target_position may be 0 before first cmd)
           Eigen::VectorXd qh(kNumBody);
-          for (int i = 0; i < kNumBody; ++i) qh[i] = rs->target_position[kNumWheel+i];
+          for (int i = 0; i < kNumBody; ++i) qh[i] = rs->position[kNumWheel+i];
           JointPositionCommandBuilder hold;
           hold.SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*30))
               .SetPosition(qh).SetMinimumTime(kStreamDt*10);
