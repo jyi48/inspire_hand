@@ -74,7 +74,26 @@ C++ RT node replacing `new_core_main.py` — rby1-sdk → ROS2 bridge with 50Hz 
 
 ## Prerequisites
 
-**1. Build & install rby1-sdk (C++ library)**
+**1. Build & install gRPC (rby1-sdk dependency)**
+
+apt 버전은 CMake config 파일이 없어 직접 빌드 필요:
+
+```bash
+sudo apt install -y build-essential cmake git pkg-config
+git clone --recurse-submodules -b v1.54.0 --depth 1 \
+  https://github.com/grpc/grpc ~/grpc
+cd ~/grpc
+cmake -B build \
+  -DgRPC_INSTALL=ON \
+  -DgRPC_BUILD_TESTS=OFF \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=/usr/local
+cmake --build build -j$(nproc)
+sudo cmake --install build
+sudo ldconfig
+```
+
+**2. Build & install rby1-sdk (C++ library)**
 ```bash
 cd ~/rby1-sdk-main
 cmake -B build -DCMAKE_INSTALL_PREFIX=/usr/local
@@ -82,7 +101,7 @@ cmake --build build -j$(nproc)
 sudo cmake --install build
 ```
 
-**2. RT priority setup (one-time, requires re-login)**
+**3. RT priority setup (one-time, requires re-login)**
 
 `/etc/security/limits.conf` 에 추가:
 ```
