@@ -22,7 +22,8 @@ find_package(rby1_core_msgs REQUIRED)
 find_package(rby1-sdk REQUIRED)
 find_package(Threads REQUIRED)
 
-# ─── Build target ────────────────────────────────────────────────────────────
+# ─── Build targets ───────────────────────────────────────────────────────────
+# robot_a (differential 2-wheel, default)
 add_executable(rby1_rt_node rby1_rt_node.cpp)
 
 target_link_libraries(rby1_rt_node
@@ -40,8 +41,28 @@ ament_target_dependencies(rby1_rt_node
   rby1_core_msgs
 )
 
+# robot_m (mecanum 4-wheel)
+add_executable(rby1_rt_node_m rby1_rt_node.cpp)
+
+target_compile_definitions(rby1_rt_node_m PRIVATE USE_MODEL_M=1)
+
+target_link_libraries(rby1_rt_node_m
+  rby1-sdk::rby1-sdk
+  Threads::Threads
+)
+
+ament_target_dependencies(rby1_rt_node_m
+  rclcpp
+  rclcpp_action
+  geometry_msgs
+  sensor_msgs
+  std_msgs
+  interbotix_xs_msgs
+  rby1_core_msgs
+)
+
 # ─── Install ─────────────────────────────────────────────────────────────────
-install(TARGETS rby1_rt_node
+install(TARGETS rby1_rt_node rby1_rt_node_m
   DESTINATION lib/${PROJECT_NAME}
 )
 

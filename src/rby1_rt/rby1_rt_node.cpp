@@ -46,13 +46,21 @@
 using namespace rb;
 using namespace rb::y1_model;
 
+// Model selection: define USE_MODEL_M to build for mecanum (robot_m, 4-wheel)
+#ifdef USE_MODEL_M
+  using ModelType = M;
+  static constexpr int kNumWheel = 4;
+#else
+  using ModelType = A;
+  static constexpr int kNumWheel = 2;
+#endif
+
 // SDK dynamics types: dyn::Robot<DOF> / dyn::State<DOF>
-using DynRobot = dyn::Robot<A::kRobotDOF>;
-using DynState = dyn::State<A::kRobotDOF>;
+using DynRobot = dyn::Robot<ModelType::kRobotDOF>;
+using DynState = dyn::State<ModelType::kRobotDOF>;
 
 static constexpr double kStreamDt   = 0.02;   // 50 Hz
 static constexpr int    kNumBody    = 20;      // 6 torso + 7 rarm + 7 larm
-static constexpr int    kNumWheel   = 2;
 static constexpr double kStopWheelT = 0.5;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -107,7 +115,7 @@ struct JointTeleopController {
 
   // Fills `out` and returns true when a new command is ready.
   // Returns false → caller sends hold command.
-  bool compute(const RobotState<A>& rs,
+  bool compute(const RobotState<ModelType>& rs,
                DynRobot& dyn,
                const std::shared_ptr<DynState>& ds,
                double dt,
@@ -190,7 +198,7 @@ struct JointImpedanceTeleopController {
 
   // Fills out_active (new cmd) or out_hold (impedance hold at cached ref).
   // Returns true if out_active was filled.
-  bool compute(const RobotState<A>& rs,
+  bool compute(const RobotState<ModelType>& rs,
                DynRobot& dyn,
                const std::shared_ptr<DynState>& ds,
                double dt,
@@ -313,12 +321,12 @@ class Rby1RtNode : public rclcpp::Node {
   }
 
  private:
-  std::shared_ptr<Robot<A>>                     robot_;
-  std::unique_ptr<RobotCommandStreamHandler<A>> stream_;
-  std::shared_ptr<DynRobot>                     dyn_;
-  std::shared_ptr<DynState>                     dyn_state_;
+  std::shared_ptr<Robot<ModelType>>                     robot_;
+  std::unique_ptr<RobotCommandStreamHandler<ModelType>> stream_;
+  std::shared_ptr<DynRobot>                             dyn_;
+  std::shared_ptr<DynState>                             dyn_state_;
 
-  std::shared_ptr<const RobotState<A>> cached_state_;
+  std::shared_ptr<const RobotState<ModelType>> cached_state_;
   std::mutex state_mtx_;
 
   std::atomic<bool> stream_enabled_{false};
@@ -358,7 +366,7 @@ class Rby1RtNode : public rclcpp::Node {
         continue;
       }
 
-      std::shared_ptr<const RobotState<A>> rs;
+      std::shared_ptr<const RobotState<ModelType>> rs;
       { std::lock_guard<std::mutex> lk(state_mtx_); rs = cached_state_; }
       if (!rs) { sleep_until_abs(next, dt_ns); continue; }
 
@@ -422,8 +430,8 @@ class Rby1RtNode : public rclcpp::Node {
   }
 
   // ── State update callback (SDK thread, ~50 Hz) ───────────────────────────
-  void on_state(const RobotState<A>& rs, const ControlManagerState& cms) {
-    { std::lock_guard<std::mutex> lk(state_mtx_); cached_state_ = std::make_shared<RobotState<A>>(rs); }
+  void on_state(const RobotState<ModelType>& rs, const ControlManagerState& cms) {
+    { std::lock_guard<std::mutex> lk(state_mtx_); cached_state_ = std::make_shared<RobotState<ModelType>>(rs); }
 
     sensor_msgs::msg::JointState jmsg;
     jmsg.header.stamp = get_clock()->now();
@@ -496,12 +504,12 @@ class Rby1RtNode : public rclcpp::Node {
   bool cmd_connect(const std::vector<std::string>& parts) {
     if (parts.size() < 2) return false;
     no_gripper_ = (parts.size() > 2 && parts[2] == "no_gripper");
-    robot_ = Robot<A>::Create(parts[1]);
+    robot_ = Robot<ModelType>::Create(parts[1]);
     if (!robot_->Connect()) return false;
     dyn_       = robot_->GetDynamics();
-    dyn_state_ = dyn_->MakeState({"base","ee_right","ee_left","link_torso_5"}, A::kRobotJointNames);
+    dyn_state_ = dyn_->MakeState({"base","ee_right","ee_left","link_torso_5"}, ModelType::kRobotJointNames);
     robot_->StartStateUpdate(
-        [this](const RobotState<A>& rs, const ControlManagerState& cms){ on_state(rs, cms); },
+        [this](const RobotState<ModelType>& rs, const ControlManagerState& cms){ on_state(rs, cms); },
         50.0);
     RCLCPP_INFO(get_logger(), "Connected to %s%s", parts[1].c_str(), no_gripper_.load() ? " (no_gripper)" : "");
     return true;
