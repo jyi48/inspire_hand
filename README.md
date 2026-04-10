@@ -1,5 +1,14 @@
 # hw-core
 
+```
+hw-core/
+  inspire_hand/
+    src/
+      inspire_hand_driver/
+      inspire_hand_msgs/
+  rby1_rt/
+```
+
 ## Dependencies
 
 - ROS2 Humble
@@ -9,7 +18,16 @@
 
 ```bash
 source /opt/ros/humble/setup.bash
-colcon build
+
+# inspire_hand only
+colcon build --base-paths inspire_hand/src
+
+# rby1_rt only
+colcon build --base-paths rby1_rt
+
+# all
+colcon build --base-paths inspire_hand/src rby1_rt
+
 source install/setup.bash
 ```
 
