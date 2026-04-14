@@ -49,7 +49,7 @@ namespace reg
   // constexpr int TOUCH_FINGERFIVE_TIP    = 4480;  // read  9
   // constexpr int TOUCH_FINGERFIVE_TOP    = 4498;  // read 96
   // constexpr int TOUCH_FINGERFIVE_MIDDLE = 4690;  // read  9
-  // constexpr int TOUCH_FINGERFIVE_PALM   = 4708;  // read 80 (msg int16[80]; 실제 데이터 96 — msg 수정 시 96으로 변경)
+  // constexpr int TOUCH_FINGERFIVE_PALM   = 4708;  // read 96 → int16[96]
   // constexpr int TOUCH_PALM              = 4900;  // read 112 → int16[112]
 }
 

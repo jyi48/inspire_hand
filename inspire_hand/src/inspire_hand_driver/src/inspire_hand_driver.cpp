@@ -206,7 +206,7 @@ void InspireHandDriver::do_read_publish(Hand & hand)
 //     r = read_s(reg::TOUCH_FINGERFIVE_TIP,    9); std::copy(r.begin(), r.end(), msg.fingerfive_tip_touch.begin());
 //     r = read_s(reg::TOUCH_FINGERFIVE_TOP,   96); std::copy(r.begin(), r.end(), msg.fingerfive_top_touch.begin());
 //     r = read_s(reg::TOUCH_FINGERFIVE_MIDDLE, 9); std::copy(r.begin(), r.end(), msg.fingerfive_middle_touch.begin());
-//     r = read_s(reg::TOUCH_FINGERFIVE_PALM,  80); std::copy(r.begin(), r.end(), msg.fingerfive_palm_touch.begin());  // msg int16[80]; 실제 데이터 96 — msg 수정 시 96으로 변경
+//     r = read_s(reg::TOUCH_FINGERFIVE_PALM,  96); std::copy(r.begin(), r.end(), msg.fingerfive_palm_touch.begin());
 //     r = read_s(reg::TOUCH_PALM,            112); std::copy(r.begin(), r.end(), msg.palm_touch.begin());
 //     hand.touch_pub->publish(msg);
 //   } catch (const std::exception & e) {

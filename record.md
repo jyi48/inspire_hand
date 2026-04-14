@@ -71,12 +71,13 @@
 - 활성화 시: hpp/cpp 내 `// touch 활성화 시 해제` 주석 전체 해제
 
 **touch read count 수정 (버그 수정, 미활성화 상태)**
-- 레퍼런스 Python 분석: data_sheet 레지스터 수는 실제 read count의 2배 (내부 표현)
-  - 실제 read count = data_sheet 수 / 2 (각 센서값 = 1 레지스터 int16)
-  - 기존 C++ 코드: 18/192/160/224로 잘못 읽음 → 올바른 값: 9/96/80/112
-  - 모든 read가 Modbus 프로토콜 한계(125) 이하 → 청킹 불필요
-- `fingerfive_palm_touch`: 실제 96값이지만 현재 msg 정의 `int16[80]` 유지 (msg 수정 시 96으로 변경)
-  - SDK IDL(`inspire_hand_touch.idl`)은 96 — 향후 msg 수정 필요
+- 레퍼런스 Python 분석: data_sheet의 세 번째 값은 바이트 수 (레지스터 수 아님)
+  - 레지스터 수 = 바이트 수 / 2 (Modbus 레지스터 1개 = 2바이트)
+  - 기존 C++ 코드: 바이트 수를 레지스터 수로 잘못 사용 (18/192/160/224)
+  - 올바른 레지스터 수: 9/96/80/112 — 모두 Modbus 한계(125) 이하
+- `InspireHandTouch.msg` 수정: `fingerfive_palm_touch` int16[80] → int16[96]
+  - SDK IDL(`_inspire_hand_touch.py`) 확인 결과 96이 올바른 값
+  - ctrl/state msg는 SDK IDL과 완전 일치 — 문제 없음
 
 **touch 다운샘플링 준비 (미활성화)**
 - tick counter 방식으로 touch를 저속(기본 20Hz)으로 실행
