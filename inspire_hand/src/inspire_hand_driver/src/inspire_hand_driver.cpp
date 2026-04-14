@@ -17,6 +17,7 @@ InspireHandDriver::InspireHandDriver(const rclcpp::NodeOptions & options)
   this->declare_parameter("modbus_port", 6000);
   this->declare_parameter("device_id",   1);
   this->declare_parameter("timer_hz",    100.0);
+  // this->declare_parameter("touch_hz", 20.0);  // touch 활성화 시 해제
 
   right_.config = {
     this->get_parameter("right_ip").as_string(), "r",
@@ -33,6 +34,9 @@ InspireHandDriver::InspireHandDriver(const rclcpp::NodeOptions & options)
   init_hand(left_);
 
   double hz = this->get_parameter("timer_hz").as_double();
+  // double touch_hz = this->get_parameter("touch_hz").as_double();  // touch 활성화 시 해제
+  // touch_interval_ = std::max(1, static_cast<int>(hz / touch_hz));
+
   auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
     std::chrono::duration<double>(1.0 / hz));
 
@@ -101,8 +105,11 @@ void InspireHandDriver::tick(Hand & hand)
   // 2. state read + publish
   do_read_publish(hand);
 
-  // 3. touch read + publish (활성화 시 주석 해제)
-  // do_touch_read_publish(hand);
+  // 3. touch read + publish — 활성화 시 아래 주석 해제
+  // if (++hand.touch_tick >= touch_interval_) {
+  //   hand.touch_tick = 0;
+  //   do_touch_read_publish(hand);
+  // }
 }
 
 bool InspireHandDriver::ensure_connected(Hand & hand)
@@ -176,6 +183,7 @@ void InspireHandDriver::do_read_publish(Hand & hand)
 }
 
 // ── touch read + publish — 활성화 시 주석 전체 해제 ──────────
+// read count = data_sheet 레지스터 수 / 2 (각 센서값 = 1 레지스터 int16)
 // void InspireHandDriver::do_touch_read_publish(Hand & hand)
 // {
 //   try {
@@ -183,23 +191,23 @@ void InspireHandDriver::do_read_publish(Hand & hand)
 //     auto read_s = [&](int addr, int n) {
 //       return hand.modbus->read_registers_short(addr, n);
 //     };
-//     auto r = read_s(reg::TOUCH_FINGERONE_TIP,    18); std::copy(r.begin(), r.end(), msg.fingerone_tip_touch.begin());
-//     r = read_s(reg::TOUCH_FINGERONE_TOP,    192); std::copy(r.begin(), r.end(), msg.fingerone_top_touch.begin());
-//     r = read_s(reg::TOUCH_FINGERONE_PALM,   160); std::copy(r.begin(), r.end(), msg.fingerone_palm_touch.begin());
-//     r = read_s(reg::TOUCH_FINGERTWO_TIP,     18); std::copy(r.begin(), r.end(), msg.fingertwo_tip_touch.begin());
-//     r = read_s(reg::TOUCH_FINGERTWO_TOP,    192); std::copy(r.begin(), r.end(), msg.fingertwo_top_touch.begin());
-//     r = read_s(reg::TOUCH_FINGERTWO_PALM,   160); std::copy(r.begin(), r.end(), msg.fingertwo_palm_touch.begin());
-//     r = read_s(reg::TOUCH_FINGERTHREE_TIP,   18); std::copy(r.begin(), r.end(), msg.fingerthree_tip_touch.begin());
-//     r = read_s(reg::TOUCH_FINGERTHREE_TOP,  192); std::copy(r.begin(), r.end(), msg.fingerthree_top_touch.begin());
-//     r = read_s(reg::TOUCH_FINGERTHREE_PALM, 160); std::copy(r.begin(), r.end(), msg.fingerthree_palm_touch.begin());
-//     r = read_s(reg::TOUCH_FINGERFOUR_TIP,    18); std::copy(r.begin(), r.end(), msg.fingerfour_tip_touch.begin());
-//     r = read_s(reg::TOUCH_FINGERFOUR_TOP,   192); std::copy(r.begin(), r.end(), msg.fingerfour_top_touch.begin());
-//     r = read_s(reg::TOUCH_FINGERFOUR_PALM,  160); std::copy(r.begin(), r.end(), msg.fingerfour_palm_touch.begin());
-//     r = read_s(reg::TOUCH_FINGERFIVE_TIP,    18); std::copy(r.begin(), r.end(), msg.fingerfive_tip_touch.begin());
-//     r = read_s(reg::TOUCH_FINGERFIVE_TOP,   192); std::copy(r.begin(), r.end(), msg.fingerfive_top_touch.begin());
-//     r = read_s(reg::TOUCH_FINGERFIVE_MIDDLE, 18); std::copy(r.begin(), r.end(), msg.fingerfive_middle_touch.begin());
-//     r = read_s(reg::TOUCH_FINGERFIVE_PALM,  192); std::copy(r.begin(), r.end(), msg.fingerfive_palm_touch.begin());
-//     r = read_s(reg::TOUCH_PALM,             224); std::copy(r.begin(), r.end(), msg.palm_touch.begin());
+//     auto r = read_s(reg::TOUCH_FINGERONE_TIP,     9); std::copy(r.begin(), r.end(), msg.fingerone_tip_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERONE_TOP,    96); std::copy(r.begin(), r.end(), msg.fingerone_top_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERONE_PALM,   80); std::copy(r.begin(), r.end(), msg.fingerone_palm_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERTWO_TIP,     9); std::copy(r.begin(), r.end(), msg.fingertwo_tip_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERTWO_TOP,    96); std::copy(r.begin(), r.end(), msg.fingertwo_top_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERTWO_PALM,   80); std::copy(r.begin(), r.end(), msg.fingertwo_palm_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERTHREE_TIP,   9); std::copy(r.begin(), r.end(), msg.fingerthree_tip_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERTHREE_TOP,  96); std::copy(r.begin(), r.end(), msg.fingerthree_top_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERTHREE_PALM, 80); std::copy(r.begin(), r.end(), msg.fingerthree_palm_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERFOUR_TIP,    9); std::copy(r.begin(), r.end(), msg.fingerfour_tip_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERFOUR_TOP,   96); std::copy(r.begin(), r.end(), msg.fingerfour_top_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERFOUR_PALM,  80); std::copy(r.begin(), r.end(), msg.fingerfour_palm_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERFIVE_TIP,    9); std::copy(r.begin(), r.end(), msg.fingerfive_tip_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERFIVE_TOP,   96); std::copy(r.begin(), r.end(), msg.fingerfive_top_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERFIVE_MIDDLE, 9); std::copy(r.begin(), r.end(), msg.fingerfive_middle_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERFIVE_PALM,  80); std::copy(r.begin(), r.end(), msg.fingerfive_palm_touch.begin());  // msg int16[80]; 실제 데이터 96 — msg 수정 시 96으로 변경
+//     r = read_s(reg::TOUCH_PALM,            112); std::copy(r.begin(), r.end(), msg.palm_touch.begin());
 //     hand.touch_pub->publish(msg);
 //   } catch (const std::exception & e) {
 //     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
