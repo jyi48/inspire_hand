@@ -585,6 +585,7 @@ class Rby1RtNode : public rclcpp::Node {
   bool cmd_stream_start(const std::string& type) {
     if (!check() || !robot_ok_ || stream_enabled_) return false;
     auto cms = robot_->GetControlManagerState();
+    RCLCPP_INFO(get_logger(), "cmd_stream_start: cms=%s", rb::to_string(cms.state).c_str());
     if (cms.state != ControlManagerState::State::kEnabled) return false;
     stream_ = robot_->CreateCommandStream();
     // 현재 상태로 hold command를 즉시 전송 — Python example 17 방식
@@ -593,6 +594,12 @@ class Rby1RtNode : public rclcpp::Node {
       auto rs = robot_->GetState();
       Eigen::VectorXd qh(kNumBody);
       for (int i = 0; i < kNumBody; ++i) qh[i] = rs.position[kNumWheel + i];
+      RCLCPP_INFO(get_logger(), "hold q torso: %.3f %.3f %.3f %.3f %.3f %.3f",
+                  qh[0], qh[1], qh[2], qh[3], qh[4], qh[5]);
+      RCLCPP_INFO(get_logger(), "hold q rarm:  %.3f %.3f %.3f %.3f %.3f %.3f %.3f",
+                  qh[6], qh[7], qh[8], qh[9], qh[10], qh[11], qh[12]);
+      RCLCPP_INFO(get_logger(), "hold q larm:  %.3f %.3f %.3f %.3f %.3f %.3f %.3f",
+                  qh[13], qh[14], qh[15], qh[16], qh[17], qh[18], qh[19]);
       MobilityCommandBuilder mc;
       mc.SetCommand(SE2VelocityCommandBuilder()
           .SetVelocity(Eigen::Vector2d::Zero(), 0.)
