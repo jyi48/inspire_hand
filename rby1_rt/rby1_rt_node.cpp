@@ -349,6 +349,7 @@ class Rby1RtNode : public rclcpp::Node {
   bool stream_open_only_logged_{false};
   bool stream_open_only_finished_logged_{false};
   bool stream_first_send_logged_{false};
+  uint64_t stream_send_count_{0};
 
   JointTeleopController          ctrl_jp_;
   JointImpedanceTeleopController ctrl_jip_;
@@ -516,10 +517,16 @@ class Rby1RtNode : public rclcpp::Node {
         }
         if (stream_) {
           auto fb = stream_->SendCommand(rc);
+          stream_send_count_++;
           if (!stream_first_send_logged_) {
-            RCLCPP_WARN(get_logger(), "stream debug: first command feedback finish_code=%d",
-                        static_cast<int>(fb.finish_code()));
+            RCLCPP_WARN(get_logger(), "stream debug: first command feedback finish_code=%d send_count=%llu",
+                        static_cast<int>(fb.finish_code()),
+                        static_cast<unsigned long long>(stream_send_count_));
             stream_first_send_logged_ = true;
+          } else if (stream_send_count_ % 10 == 0) {
+            RCLCPP_INFO(get_logger(), "stream debug: send_count=%llu finish_code=%d",
+                        static_cast<unsigned long long>(stream_send_count_),
+                        static_cast<int>(fb.finish_code()));
           }
         }
       } catch (const std::exception& e) {
@@ -619,6 +626,7 @@ class Rby1RtNode : public rclcpp::Node {
     stream_open_only_logged_ = false;
     stream_open_only_finished_logged_ = false;
     stream_first_send_logged_ = false;
+    stream_send_count_ = 0;
   }
 
   bool wait_for_stream_start_window(std::chrono::milliseconds timeout = std::chrono::milliseconds(3000)) {
@@ -792,6 +800,7 @@ class Rby1RtNode : public rclcpp::Node {
     stream_open_only_logged_ = false;
     stream_open_only_finished_logged_ = false;
     stream_first_send_logged_ = false;
+    stream_send_count_ = 0;
     RCLCPP_INFO(get_logger(), "cmd_stream_start: stream created, enabled (open_only=%s, minimal_payload=%s)",
                 kDebugStreamOpenOnly ? "true" : "false",
                 kDebugStreamUseMinimalPayload ? "true" : "false");
