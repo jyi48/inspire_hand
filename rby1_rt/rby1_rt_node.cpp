@@ -62,7 +62,7 @@ using DynState = dyn::State<ModelType::kRobotDOF>;
 static constexpr double kStreamDt   = 0.02;   // 50 Hz
 static constexpr int    kNumBody    = 20;      // 6 torso + 7 rarm + 7 larm
 static constexpr double kStopWheelT = 0.5;
-static constexpr bool   kDebugStreamOpenOnly = true;
+static constexpr bool   kDebugStreamOpenOnly = false;
 static constexpr double kDebugStreamOpenOnlyDurationSec = 1.0;
 static constexpr bool   kDebugStreamUseMinimalPayload = true;
 
