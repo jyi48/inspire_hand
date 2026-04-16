@@ -591,33 +591,15 @@ class Rby1RtNode : public rclcpp::Node {
     RCLCPP_INFO(get_logger(), "cmd_stream_start: cms=%s", rb::to_string(cms.state).c_str());
     if (cms.state != ControlManagerState::State::kEnabled) return false;
     stream_ = robot_->CreateCommandStream();
-    // 현재 상태로 hold command를 즉시 전송 — Python example 17 방식
-    // stream 생성 직후 첫 command를 즉시 보내야 서버가 stream을 유지함
-    try {
-      auto rs = robot_->GetState();
-      Eigen::VectorXd qh(kNumBody);
-      for (int i = 0; i < kNumBody; ++i) qh[i] = rs.position[kNumWheel + i];
-      RCLCPP_INFO(get_logger(), "hold q torso: %.3f %.3f %.3f %.3f %.3f %.3f",
-                  qh[0], qh[1], qh[2], qh[3], qh[4], qh[5]);
-      RCLCPP_INFO(get_logger(), "hold q rarm:  %.3f %.3f %.3f %.3f %.3f %.3f %.3f",
-                  qh[6], qh[7], qh[8], qh[9], qh[10], qh[11], qh[12]);
-      RCLCPP_INFO(get_logger(), "hold q larm:  %.3f %.3f %.3f %.3f %.3f %.3f %.3f",
-                  qh[13], qh[14], qh[15], qh[16], qh[17], qh[18], qh[19]);
-      MobilityCommandBuilder mc;
-      mc.SetCommand(SE2VelocityCommandBuilder()
-          .SetVelocity(Eigen::Vector2d::Zero(), 0.)
-          .SetMinimumTime(kStreamDt * 5)
-          .SetAccelerationLimit(Eigen::Vector2d::Constant(10.), 10.));
-      JointPositionCommandBuilder hold;
-      hold.SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt * 30))
-          .SetPosition(qh).SetMinimumTime(kStreamDt * 10);
-      ComponentBasedCommandBuilder cbc;
-      cbc.SetBodyCommand(hold).SetMobilityCommand(mc);
-      RobotCommandBuilder rc;
-      rc.SetCommand(cbc);
-      stream_->SendCommand(rc);
-    } catch (const std::exception& e) {
-      RCLCPP_ERROR(get_logger(), "cmd_stream_start: initial command failed: %s", e.what());
+    // Python new_core_main.py 방식: stream 생성 후 즉시 명령 보내지 않음
+    // 펌웨어가 준비되기 전에 명령을 보내면 MajorFault 유발 가능
+    // stream_loop의 fallback hold가 첫 명령을 담당
+    // 단, 50ms 대기 후 stream이 이미 죽었는지 확인
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (stream_->IsDone()) {
+      auto cms2 = robot_->GetControlManagerState();
+      RCLCPP_ERROR(get_logger(), "stream closed during 50ms wait: cms=%s",
+                   rb::to_string(cms2.state).c_str());
       stream_.reset();
       return false;
     }
