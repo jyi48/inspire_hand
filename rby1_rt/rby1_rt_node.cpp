@@ -99,7 +99,9 @@ struct JointTeleopController {
 
   std::array<double, kNumBody> q{}, q_filtered{};
   std::array<double, kNumBody> max_q{}, min_q{}, max_dq{}, max_ddq{};
-  std::array<double, 16> cmd_array{};
+  // cmd_array: q20 포맷 호환 [torso(6), rarm(7), larm(7), gripper(2)] = 22
+  // torso(0..5)는 현재 미사용 — 추후 torso teleop 시 compute()에서 읽으면 됨
+  std::array<double, 22> cmd_array{};
   double gripper_p_ref[2]{0.5, 0.5};
   double gripper_ref[2]{0., 0.};
   double gripper_pos[2]{0., 0.};
@@ -139,10 +141,10 @@ struct JointTeleopController {
     new_cmd = false;
     {
       std::lock_guard<std::mutex> lk(mtx);
-      for (int i = 0; i < 7; ++i) q[6 +i] = cmd_array[i];
-      for (int i = 0; i < 7; ++i) q[13+i] = cmd_array[7+i];
-      gripper_p_ref[0] = cmd_array[14];
-      gripper_p_ref[1] = cmd_array[15];
+      for (int i = 0; i < 7; ++i) q[6 +i] = cmd_array[6+i];   // rarm: cmd[6..12]
+      for (int i = 0; i < 7; ++i) q[13+i] = cmd_array[13+i];  // larm: cmd[13..19]
+      gripper_p_ref[0] = cmd_array[20];
+      gripper_p_ref[1] = cmd_array[21];
     }
     constexpr double dz = 0.1, gain = 2.;
     for (int i = 0; i < 2; ++i) {
@@ -178,7 +180,8 @@ struct JointImpedanceTeleopController {
 
   std::array<double, kNumBody> q{}, q_filtered{};
   std::array<double, kNumBody> max_q{}, min_q{};
-  std::array<double, 16> cmd_array{};
+  // cmd_array: q20 포맷 호환 [torso(6), rarm(7), larm(7), gripper(2)] = 22
+  std::array<double, 22> cmd_array{};
   double gripper_p_ref[2]{0., 0.};
   double gripper_ref[2]{0., 0.};
   double gripper_pos[2]{0., 0.};
@@ -251,10 +254,10 @@ struct JointImpedanceTeleopController {
     imp_ref_set = false;
     {
       std::lock_guard<std::mutex> lk(mtx);
-      for (int i = 0; i < 7; ++i) q[6 +i] = cmd_array[i];
-      for (int i = 0; i < 7; ++i) q[13+i] = cmd_array[7+i];
-      gripper_p_ref[0] = cmd_array[14];
-      gripper_p_ref[1] = cmd_array[15];
+      for (int i = 0; i < 7; ++i) q[6 +i] = cmd_array[6+i];   // rarm: cmd[6..12]
+      for (int i = 0; i < 7; ++i) q[13+i] = cmd_array[13+i];  // larm: cmd[13..19]
+      gripper_p_ref[0] = cmd_array[20];
+      gripper_p_ref[1] = cmd_array[21];
     }
     constexpr double dz = 0.1, gain = 2.;
     for (int i = 0; i < 2; ++i) {
