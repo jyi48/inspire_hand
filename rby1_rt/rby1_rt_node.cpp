@@ -62,9 +62,6 @@ using DynState = dyn::State<ModelType::kRobotDOF>;
 static constexpr double kStreamDt   = 0.02;   // 50 Hz
 static constexpr int    kNumBody    = 20;      // 6 torso + 7 rarm + 7 larm
 static constexpr double kStopWheelT = 0.5;
-static constexpr bool   kDebugStreamOpenOnly = false;
-static constexpr double kDebugStreamOpenOnlyDurationSec = 1.0;
-static constexpr bool   kDebugStreamUseMinimalPayload = true;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -118,13 +115,11 @@ struct JointTeleopController {
     new_cmd = true;
   }
 
-  // Fills `out` and returns true when a new command is ready.
-  // Returns false → caller sends hold command.
+  // q_filtered 업데이트 후 true 반환 (새 명령 있음); false → hold.
   bool compute(const RobotState<ModelType>& rs,
                DynRobot& dyn,
                const std::shared_ptr<DynState>& ds,
-               double dt,
-               JointPositionCommandBuilder& out) {
+               double dt) {
     if (traj_dt_cnt == 0) {
       auto ub  = dyn.GetLimitQUpper(ds);
       auto lb  = dyn.GetLimitQLower(ds);
@@ -157,16 +152,10 @@ struct JointTeleopController {
       else                     gripper_ref[i] = 0.;
     }
     constexpr double alpha = 0.95;
-    for (int i = 0; i < kNumBody; ++i)
+    for (int i = 0; i < kNumBody; ++i) {
       q_filtered[i] = alpha*q_filtered[i] + (1.-alpha)*q[i];
-    std::array<double, kNumBody> qc;
-    for (int i = 0; i < kNumBody; ++i)
-      qc[i] = std::clamp(q_filtered[i], min_q[i], max_q[i]);
-    Eigen::Map<Eigen::VectorXd> qv(qc.data(), kNumBody);
-    Eigen::Map<Eigen::VectorXd> dqv(max_dq.data(), kNumBody);
-    Eigen::Map<Eigen::VectorXd> ddqv(max_ddq.data(), kNumBody);
-    out.SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(dt*30))
-       .SetPosition(qv).SetVelocityLimit(dqv).SetAccelerationLimit(ddqv).SetMinimumTime(dt*2);
+      q_filtered[i] = std::clamp(q_filtered[i], min_q[i], max_q[i]);
+    }
     traj_dt_cnt++;
     return true;
   }
@@ -346,8 +335,6 @@ class Rby1RtNode : public rclcpp::Node {
   std::mutex  command_mtx_;
   std::chrono::steady_clock::time_point stream_started_at_{};
   std::chrono::steady_clock::time_point last_blocking_command_done_at_{std::chrono::steady_clock::now()};
-  bool stream_open_only_logged_{false};
-  bool stream_open_only_finished_logged_{false};
   bool stream_first_send_logged_{false};
   uint64_t stream_send_count_{0};
 
@@ -383,8 +370,6 @@ class Rby1RtNode : public rclcpp::Node {
       }
       if (was_disabled) {
         RCLCPP_INFO(get_logger(), "stream_loop: first tick after enable");
-        stream_open_only_logged_ = false;
-        stream_open_only_finished_logged_ = false;
         stream_first_send_logged_ = false;
         was_disabled = false;
       }
@@ -409,88 +394,47 @@ class Rby1RtNode : public rclcpp::Node {
       std::string ctr;
       { std::lock_guard<std::mutex> lk(ctr_type_mtx_); ctr = ctr_type_; }
 
-      const auto now = std::chrono::steady_clock::now();
-      const double elapsed_sec =
-          std::chrono::duration_cast<std::chrono::duration<double>>(now - stream_started_at_).count();
-
-      if (kDebugStreamOpenOnly && elapsed_sec < kDebugStreamOpenOnlyDurationSec) {
-        if (!stream_open_only_logged_) {
-          RCLCPP_WARN(get_logger(),
-                      "stream debug: open-only mode active for %.2fs (no SendCommand)",
-                      kDebugStreamOpenOnlyDurationSec);
-          stream_open_only_logged_ = true;
-        }
-        if (stream_ && stream_->IsDone()) {
-          auto cms2 = robot_->GetControlManagerState();
-          RCLCPP_ERROR(get_logger(),
-                       "stream died during open-only window at %.3fs: cms=%s",
-                       elapsed_sec, rb::to_string(cms2.state).c_str());
-          cleanup_stream("stream died during open-only window");
-        }
-        sleep_until_abs(next, dt_ns);
-        continue;
-      }
-
-      if (kDebugStreamOpenOnly && !stream_open_only_finished_logged_) {
-        RCLCPP_WARN(get_logger(), "stream debug: open-only finished, entering first SendCommand stage");
-        stream_open_only_finished_logged_ = true;
-      }
-
       RobotCommandBuilder rc;
 
-      if (ctr == "JointPosition" && kDebugStreamUseMinimalPayload) {
+      if (ctr == "JointPosition") {
+        // hold position: target_position이 유효하면 사용, 아니면 실제 encoder 위치
         Eigen::VectorXd qh(kNumBody);
         double tp_norm = 0.;
         for (int i = 0; i < kNumBody; ++i)
           tp_norm += rs->target_position[kNumWheel+i] * rs->target_position[kNumWheel+i];
-        if (tp_norm > 1e-6) {
-          for (int i = 0; i < kNumBody; ++i) qh[i] = rs->target_position[kNumWheel+i];
+        for (int i = 0; i < kNumBody; ++i)
+          qh[i] = (tp_norm > 1e-6) ? rs->target_position[kNumWheel+i] : rs->position[kNumWheel+i];
+
+        bool has_new = ctrl_jp_.compute(*rs, *dyn_, dyn_state_, kStreamDt);
+        BodyComponentBasedCommandBuilder bc;
+        if (has_new) {
+          // 새 명령: IK에서 필터링/클램핑된 팔 각도 사용 (BodyComponentBased, mobility 없음)
+          Eigen::Map<Eigen::VectorXd> ra(ctrl_jp_.q_filtered.data() + 6, 7);
+          Eigen::Map<Eigen::VectorXd> la(ctrl_jp_.q_filtered.data() + 13, 7);
+          bc.SetRightArmCommand(
+                JointPositionCommandBuilder()
+                    .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*30))
+                    .SetPosition(ra).SetMinimumTime(kStreamDt*2))
+            .SetLeftArmCommand(
+                JointPositionCommandBuilder()
+                    .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*30))
+                    .SetPosition(la).SetMinimumTime(kStreamDt*2));
         } else {
-          for (int i = 0; i < kNumBody; ++i) qh[i] = rs->position[kNumWheel+i];
-        }
-        Eigen::Map<Eigen::VectorXd> ra(qh.data() + 6, 7);
-        Eigen::Map<Eigen::VectorXd> la(qh.data() + 13, 7);
-        BodyComponentBasedCommandBuilder bc_hold;
-        bc_hold
-            .SetRightArmCommand(
+          // Hold: BodyComponentBased arms-only (MajorFault 없이 확인된 패턴)
+          Eigen::Map<Eigen::VectorXd> ra(qh.data() + 6, 7);
+          Eigen::Map<Eigen::VectorXd> la(qh.data() + 13, 7);
+          bc.SetRightArmCommand(
                 JointPositionCommandBuilder()
                     .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
-                    .SetPosition(ra)
-                    .SetMinimumTime(0.2))
+                    .SetPosition(ra).SetMinimumTime(0.2))
             .SetLeftArmCommand(
                 JointPositionCommandBuilder()
                     .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
-                    .SetPosition(la)
-                    .SetMinimumTime(0.2));
-        ComponentBasedCommandBuilder cbc;
-        cbc.SetBodyCommand(bc_hold);
-        rc.SetCommand(cbc);
-      } else if (ctr == "JointPosition") {
-        JointPositionCommandBuilder bc;
-        if (ctrl_jp_.compute(*rs, *dyn_, dyn_state_, kStreamDt, bc)) {
-          ComponentBasedCommandBuilder cbc;
-          cbc.SetBodyCommand(bc).SetMobilityCommand(mc);
-          rc.SetCommand(cbc);
-        } else {
-          // Hold: Python new_core_main.py와 동일하게 target_position 사용
-          // target_position이 모두 0이면(아직 미설정) 실제 encoder position 사용
-          Eigen::VectorXd qh(kNumBody);
-          double tp_norm = 0.;
-          for (int i = 0; i < kNumBody; ++i)
-            tp_norm += rs->target_position[kNumWheel+i] * rs->target_position[kNumWheel+i];
-          if (tp_norm > 1e-6) {
-            for (int i = 0; i < kNumBody; ++i) qh[i] = rs->target_position[kNumWheel+i];
-          } else {
-            // target_position이 0인 경우 실제 encoder position 사용
-            for (int i = 0; i < kNumBody; ++i) qh[i] = rs->position[kNumWheel+i];
-          }
-          JointPositionCommandBuilder hold;
-          hold.SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*30))
-              .SetPosition(qh).SetMinimumTime(kStreamDt*10);
-          ComponentBasedCommandBuilder cbc;
-          cbc.SetBodyCommand(hold).SetMobilityCommand(mc);
-          rc.SetCommand(cbc);
+                    .SetPosition(la).SetMinimumTime(0.2));
         }
+        ComponentBasedCommandBuilder cbc;
+        cbc.SetBodyCommand(bc);
+        rc.SetCommand(cbc);
       } else if (ctr == "JointImpedance") {
         BodyComponentBasedCommandBuilder bc_active, bc_hold;
         bool has_new = ctrl_jip_.compute(*rs, *dyn_, dyn_state_, kStreamDt, bc_active, bc_hold);
@@ -623,8 +567,6 @@ class Rby1RtNode : public rclcpp::Node {
     }
     ctrl_jp_.enabled = false;
     ctrl_jip_.enabled = false;
-    stream_open_only_logged_ = false;
-    stream_open_only_finished_logged_ = false;
     stream_first_send_logged_ = false;
     stream_send_count_ = 0;
   }
@@ -797,13 +739,9 @@ class Rby1RtNode : public rclcpp::Node {
     { std::lock_guard<std::mutex> lk(ctr_type_mtx_); ctr_type_ = type; }
     stream_started_at_ = std::chrono::steady_clock::now();
     stream_enabled_ = true;
-    stream_open_only_logged_ = false;
-    stream_open_only_finished_logged_ = false;
     stream_first_send_logged_ = false;
     stream_send_count_ = 0;
-    RCLCPP_INFO(get_logger(), "cmd_stream_start: stream created, enabled (open_only=%s, minimal_payload=%s)",
-                kDebugStreamOpenOnly ? "true" : "false",
-                kDebugStreamUseMinimalPayload ? "true" : "false");
+    RCLCPP_INFO(get_logger(), "cmd_stream_start: stream created, ctr_type=%s", type.c_str());
     return true;
   }
   bool cmd_stream_stop() {
