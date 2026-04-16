@@ -343,7 +343,9 @@ class Rby1RtNode : public rclcpp::Node {
 
   std::string ctr_type_{"JointPosition"};
   std::mutex  ctr_type_mtx_;
+  std::mutex  command_mtx_;
   std::chrono::steady_clock::time_point stream_started_at_{};
+  std::chrono::steady_clock::time_point last_blocking_command_done_at_{std::chrono::steady_clock::now()};
   bool stream_open_only_logged_{false};
 
   JointTeleopController          ctrl_jp_;
@@ -555,6 +557,7 @@ class Rby1RtNode : public rclcpp::Node {
 
   // ── Command dispatch ─────────────────────────────────────────────────────
   void execute_command(const std::shared_ptr<GoalHandleCmd>& gh) {
+    std::lock_guard<std::mutex> cmd_lk(command_mtx_);
     auto result = std::make_shared<Rby1Command::Result>();
     const std::string& cmd = gh->get_goal()->command;
     RCLCPP_INFO(get_logger(), "Command: %s", cmd.c_str());
@@ -589,6 +592,67 @@ class Rby1RtNode : public rclcpp::Node {
 
   // ── SDK helpers ──────────────────────────────────────────────────────────
   bool check() const { return robot_ && robot_->IsConnected(); }
+
+  bool wait_for_stream_start_window(std::chrono::milliseconds timeout = std::chrono::milliseconds(3000)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    int settled_samples = 0;
+
+    while (std::chrono::steady_clock::now() < deadline && rclcpp::ok()) {
+      auto cms = robot_->GetControlManagerState();
+      if (cms.state != ControlManagerState::State::kEnabled) {
+        settled_samples = 0;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        continue;
+      }
+
+      std::shared_ptr<const RobotState<ModelType>> rs;
+      { std::lock_guard<std::mutex> lk(state_mtx_); rs = cached_state_; }
+      if (!rs) {
+        settled_samples = 0;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        continue;
+      }
+
+      double max_body_vel = 0.;
+      double max_body_err = 0.;
+      for (int i = 0; i < kNumBody; ++i) {
+        max_body_vel = std::max(max_body_vel, std::abs(rs->velocity[kNumWheel + i]));
+        max_body_err = std::max(max_body_err,
+                                std::abs(rs->target_position[kNumWheel + i] - rs->position[kNumWheel + i]));
+      }
+
+      if (max_body_vel < 0.05 && max_body_err < 0.03) {
+        settled_samples++;
+        if (settled_samples >= 5) {
+          RCLCPP_INFO(get_logger(),
+                      "stream start window ready: max_vel=%.4f max_err=%.4f",
+                      max_body_vel, max_body_err);
+          return true;
+        }
+      } else {
+        settled_samples = 0;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    std::shared_ptr<const RobotState<ModelType>> rs;
+    { std::lock_guard<std::mutex> lk(state_mtx_); rs = cached_state_; }
+    if (rs) {
+      double max_body_vel = 0.;
+      double max_body_err = 0.;
+      for (int i = 0; i < kNumBody; ++i) {
+        max_body_vel = std::max(max_body_vel, std::abs(rs->velocity[kNumWheel + i]));
+        max_body_err = std::max(max_body_err,
+                                std::abs(rs->target_position[kNumWheel + i] - rs->position[kNumWheel + i]));
+      }
+      RCLCPP_WARN(get_logger(),
+                  "stream start window timeout: max_vel=%.4f max_err=%.4f",
+                  max_body_vel, max_body_err);
+    } else {
+      RCLCPP_WARN(get_logger(), "stream start window timeout: no cached robot state");
+    }
+    return false;
+  }
 
   bool cmd_connect(const std::vector<std::string>& parts) {
     if (parts.size() < 2) return false;
@@ -651,13 +715,30 @@ class Rby1RtNode : public rclcpp::Node {
     cmd_stream_stop();
     RobotCommandBuilder rc;
     rc.SetCommand(WholeBodyCommandBuilder().SetCommand(StopCommandBuilder()));
-    return robot_->SendCommand(rc, 99)->Get().finish_code() == RobotCommandFeedback::FinishCode::kOk;
+    const bool ok =
+        robot_->SendCommand(rc, 99)->Get().finish_code() == RobotCommandFeedback::FinishCode::kOk;
+    if (ok) last_blocking_command_done_at_ = std::chrono::steady_clock::now();
+    return ok;
   }
   bool cmd_stream_start(const std::string& type) {
     if (!check() || !robot_ok_ || stream_enabled_) return false;
     auto cms = robot_->GetControlManagerState();
     RCLCPP_INFO(get_logger(), "cmd_stream_start: cms=%s", rb::to_string(cms.state).c_str());
     if (cms.state != ControlManagerState::State::kEnabled) return false;
+    const auto since_blocking_done =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - last_blocking_command_done_at_);
+    if (since_blocking_done < std::chrono::milliseconds(1200)) {
+      const auto wait_ms = std::chrono::milliseconds(1200) - since_blocking_done;
+      RCLCPP_INFO(get_logger(),
+                  "cmd_stream_start: cooling down for %lld ms after blocking command",
+                  static_cast<long long>(wait_ms.count()));
+      std::this_thread::sleep_for(wait_ms);
+    }
+    if (!wait_for_stream_start_window()) {
+      RCLCPP_ERROR(get_logger(), "cmd_stream_start: robot/control manager not settled for stream start");
+      return false;
+    }
 
     // Python new_core_main.py와 동일한 방식:
     // create_command_stream() 후 즉시 stream_enabled = True 설정, 별도 대기 없음
@@ -712,7 +793,10 @@ class Rby1RtNode : public rclcpp::Node {
     cbc.SetBodyCommand(bc);
     RobotCommandBuilder rc;
     rc.SetCommand(cbc);
-    return robot_->SendCommand(rc, 20)->Get().finish_code() == RobotCommandFeedback::FinishCode::kOk;
+    const bool ok =
+        robot_->SendCommand(rc, 20)->Get().finish_code() == RobotCommandFeedback::FinishCode::kOk;
+    if (ok) last_blocking_command_done_at_ = std::chrono::steady_clock::now();
+    return ok;
   }
   bool cmd_clean_test() {
     if (!check() || !robot_ok_) return false;
