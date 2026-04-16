@@ -347,6 +347,8 @@ class Rby1RtNode : public rclcpp::Node {
   std::chrono::steady_clock::time_point stream_started_at_{};
   std::chrono::steady_clock::time_point last_blocking_command_done_at_{std::chrono::steady_clock::now()};
   bool stream_open_only_logged_{false};
+  bool stream_open_only_finished_logged_{false};
+  bool stream_first_send_logged_{false};
 
   JointTeleopController          ctrl_jp_;
   JointImpedanceTeleopController ctrl_jip_;
@@ -381,6 +383,8 @@ class Rby1RtNode : public rclcpp::Node {
       if (was_disabled) {
         RCLCPP_INFO(get_logger(), "stream_loop: first tick after enable");
         stream_open_only_logged_ = false;
+        stream_open_only_finished_logged_ = false;
+        stream_first_send_logged_ = false;
         was_disabled = false;
       }
 
@@ -420,13 +424,15 @@ class Rby1RtNode : public rclcpp::Node {
           RCLCPP_ERROR(get_logger(),
                        "stream died during open-only window at %.3fs: cms=%s",
                        elapsed_sec, rb::to_string(cms2.state).c_str());
-          stream_enabled_ = false;
-          stream_->Cancel();
-          stream_.reset();
-          ctrl_jp_.enabled = ctrl_jip_.enabled = false;
+          cleanup_stream("stream died during open-only window");
         }
         sleep_until_abs(next, dt_ns);
         continue;
+      }
+
+      if (kDebugStreamOpenOnly && !stream_open_only_finished_logged_) {
+        RCLCPP_WARN(get_logger(), "stream debug: open-only finished, entering first SendCommand stage");
+        stream_open_only_finished_logged_ = true;
       }
 
       RobotCommandBuilder rc;
@@ -500,21 +506,27 @@ class Rby1RtNode : public rclcpp::Node {
         auto cms2 = robot_->GetControlManagerState();
         RCLCPP_ERROR(get_logger(), "stream died before SendCommand: cms=%s",
                      rb::to_string(cms2.state).c_str());
-        stream_enabled_ = false;
-        stream_->Cancel(); stream_.reset();
-        ctrl_jp_.enabled = ctrl_jip_.enabled = false;
+        cleanup_stream("stream died before SendCommand");
         sleep_until_abs(next, dt_ns);
         continue;
       }
       try {
-        if (stream_) stream_->SendCommand(rc);
+        if (!stream_first_send_logged_) {
+          RCLCPP_WARN(get_logger(), "stream debug: about to send first command");
+        }
+        if (stream_) {
+          auto fb = stream_->SendCommand(rc);
+          if (!stream_first_send_logged_) {
+            RCLCPP_WARN(get_logger(), "stream debug: first command feedback finish_code=%d",
+                        static_cast<int>(fb.finish_code()));
+            stream_first_send_logged_ = true;
+          }
+        }
       } catch (const std::exception& e) {
         auto cms2 = robot_->GetControlManagerState();
         RCLCPP_ERROR(get_logger(), "stream SendCommand threw: %s | cms=%s",
                      e.what(), rb::to_string(cms2.state).c_str());
-        stream_enabled_ = false;
-        if (stream_) { stream_->Cancel(); stream_.reset(); }
-        ctrl_jp_.enabled = ctrl_jip_.enabled = false;
+        cleanup_stream("stream SendCommand threw");
       }
       sleep_until_abs(next, dt_ns);
     }
@@ -592,6 +604,22 @@ class Rby1RtNode : public rclcpp::Node {
 
   // ── SDK helpers ──────────────────────────────────────────────────────────
   bool check() const { return robot_ && robot_->IsConnected(); }
+
+  void cleanup_stream(const char* reason) {
+    auto cms = robot_ ? robot_->GetControlManagerState() : ControlManagerState{};
+    RCLCPP_WARN(get_logger(), "cleanup_stream: %s | cms=%s",
+                reason, rb::to_string(cms.state).c_str());
+    stream_enabled_ = false;
+    if (stream_) {
+      stream_->Cancel();
+      stream_.reset();
+    }
+    ctrl_jp_.enabled = false;
+    ctrl_jip_.enabled = false;
+    stream_open_only_logged_ = false;
+    stream_open_only_finished_logged_ = false;
+    stream_first_send_logged_ = false;
+  }
 
   bool wait_for_stream_start_window(std::chrono::milliseconds timeout = std::chrono::milliseconds(3000)) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -724,6 +752,13 @@ class Rby1RtNode : public rclcpp::Node {
     if (!check() || !robot_ok_ || stream_enabled_) return false;
     auto cms = robot_->GetControlManagerState();
     RCLCPP_INFO(get_logger(), "cmd_stream_start: cms=%s", rb::to_string(cms.state).c_str());
+    if (cms.state == ControlManagerState::State::kMajorFault ||
+        cms.state == ControlManagerState::State::kMinorFault) {
+      RCLCPP_ERROR(get_logger(), "cmd_stream_start: control manager faulted before stream start: cms=%s",
+                   rb::to_string(cms.state).c_str());
+      cleanup_stream("faulted before stream start");
+      return false;
+    }
     if (cms.state != ControlManagerState::State::kEnabled) return false;
     const auto since_blocking_done =
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -748,12 +783,15 @@ class Rby1RtNode : public rclcpp::Node {
       auto cms2 = robot_->GetControlManagerState();
       RCLCPP_ERROR(get_logger(), "stream already closed at creation: cms=%s",
                    rb::to_string(cms2.state).c_str());
-      stream_.reset();
+      cleanup_stream("stream already closed at creation");
       return false;
     }
     { std::lock_guard<std::mutex> lk(ctr_type_mtx_); ctr_type_ = type; }
     stream_started_at_ = std::chrono::steady_clock::now();
     stream_enabled_ = true;
+    stream_open_only_logged_ = false;
+    stream_open_only_finished_logged_ = false;
+    stream_first_send_logged_ = false;
     RCLCPP_INFO(get_logger(), "cmd_stream_start: stream created, enabled (open_only=%s, minimal_payload=%s)",
                 kDebugStreamOpenOnly ? "true" : "false",
                 kDebugStreamUseMinimalPayload ? "true" : "false");
