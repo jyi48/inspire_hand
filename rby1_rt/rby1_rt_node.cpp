@@ -62,6 +62,9 @@ using DynState = dyn::State<ModelType::kRobotDOF>;
 static constexpr double kStreamDt   = 0.02;   // 50 Hz
 static constexpr int    kNumBody    = 20;      // 6 torso + 7 rarm + 7 larm
 static constexpr double kStopWheelT = 0.5;
+static constexpr bool   kDebugStreamOpenOnly = true;
+static constexpr double kDebugStreamOpenOnlyDurationSec = 1.0;
+static constexpr bool   kDebugStreamUseMinimalPayload = true;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -340,6 +343,8 @@ class Rby1RtNode : public rclcpp::Node {
 
   std::string ctr_type_{"JointPosition"};
   std::mutex  ctr_type_mtx_;
+  std::chrono::steady_clock::time_point stream_started_at_{};
+  bool stream_open_only_logged_{false};
 
   JointTeleopController          ctrl_jp_;
   JointImpedanceTeleopController ctrl_jip_;
@@ -373,6 +378,7 @@ class Rby1RtNode : public rclcpp::Node {
       }
       if (was_disabled) {
         RCLCPP_INFO(get_logger(), "stream_loop: first tick after enable");
+        stream_open_only_logged_ = false;
         was_disabled = false;
       }
 
@@ -396,9 +402,61 @@ class Rby1RtNode : public rclcpp::Node {
       std::string ctr;
       { std::lock_guard<std::mutex> lk(ctr_type_mtx_); ctr = ctr_type_; }
 
+      const auto now = std::chrono::steady_clock::now();
+      const double elapsed_sec =
+          std::chrono::duration_cast<std::chrono::duration<double>>(now - stream_started_at_).count();
+
+      if (kDebugStreamOpenOnly && elapsed_sec < kDebugStreamOpenOnlyDurationSec) {
+        if (!stream_open_only_logged_) {
+          RCLCPP_WARN(get_logger(),
+                      "stream debug: open-only mode active for %.2fs (no SendCommand)",
+                      kDebugStreamOpenOnlyDurationSec);
+          stream_open_only_logged_ = true;
+        }
+        if (stream_ && stream_->IsDone()) {
+          auto cms2 = robot_->GetControlManagerState();
+          RCLCPP_ERROR(get_logger(),
+                       "stream died during open-only window at %.3fs: cms=%s",
+                       elapsed_sec, rb::to_string(cms2.state).c_str());
+          stream_enabled_ = false;
+          stream_->Cancel();
+          stream_.reset();
+          ctrl_jp_.enabled = ctrl_jip_.enabled = false;
+        }
+        sleep_until_abs(next, dt_ns);
+        continue;
+      }
+
       RobotCommandBuilder rc;
 
-      if (ctr == "JointPosition") {
+      if (ctr == "JointPosition" && kDebugStreamUseMinimalPayload) {
+        Eigen::VectorXd qh(kNumBody);
+        double tp_norm = 0.;
+        for (int i = 0; i < kNumBody; ++i)
+          tp_norm += rs->target_position[kNumWheel+i] * rs->target_position[kNumWheel+i];
+        if (tp_norm > 1e-6) {
+          for (int i = 0; i < kNumBody; ++i) qh[i] = rs->target_position[kNumWheel+i];
+        } else {
+          for (int i = 0; i < kNumBody; ++i) qh[i] = rs->position[kNumWheel+i];
+        }
+        Eigen::Map<Eigen::VectorXd> ra(qh.data() + 6, 7);
+        Eigen::Map<Eigen::VectorXd> la(qh.data() + 13, 7);
+        BodyComponentBasedCommandBuilder bc_hold;
+        bc_hold
+            .SetRightArmCommand(
+                JointPositionCommandBuilder()
+                    .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
+                    .SetPosition(ra)
+                    .SetMinimumTime(0.2))
+            .SetLeftArmCommand(
+                JointPositionCommandBuilder()
+                    .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
+                    .SetPosition(la)
+                    .SetMinimumTime(0.2));
+        ComponentBasedCommandBuilder cbc;
+        cbc.SetBodyCommand(bc_hold);
+        rc.SetCommand(cbc);
+      } else if (ctr == "JointPosition") {
         JointPositionCommandBuilder bc;
         if (ctrl_jp_.compute(*rs, *dyn_, dyn_state_, kStreamDt, bc)) {
           ComponentBasedCommandBuilder cbc;
@@ -613,8 +671,11 @@ class Rby1RtNode : public rclcpp::Node {
       return false;
     }
     { std::lock_guard<std::mutex> lk(ctr_type_mtx_); ctr_type_ = type; }
+    stream_started_at_ = std::chrono::steady_clock::now();
     stream_enabled_ = true;
-    RCLCPP_INFO(get_logger(), "cmd_stream_start: stream created, enabled");
+    RCLCPP_INFO(get_logger(), "cmd_stream_start: stream created, enabled (open_only=%s, minimal_payload=%s)",
+                kDebugStreamOpenOnly ? "true" : "false",
+                kDebugStreamUseMinimalPayload ? "true" : "false");
     return true;
   }
   bool cmd_stream_stop() {
