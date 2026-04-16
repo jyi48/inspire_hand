@@ -362,11 +362,18 @@ class Rby1RtNode : public rclcpp::Node {
     clock_gettime(CLOCK_MONOTONIC, &next);
     const long dt_ns = static_cast<long>(kStreamDt * 1e9);
 
+    bool was_disabled = true;  // 첫 진입 타이밍 측정용
+
     while (rclcpp::ok()) {
       if (!stream_enabled_) {
+        was_disabled = true;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         clock_gettime(CLOCK_MONOTONIC, &next);
         continue;
+      }
+      if (was_disabled) {
+        RCLCPP_INFO(get_logger(), "stream_loop: first tick after enable");
+        was_disabled = false;
       }
 
       std::shared_ptr<const RobotState<ModelType>> rs;
@@ -398,9 +405,18 @@ class Rby1RtNode : public rclcpp::Node {
           cbc.SetBodyCommand(bc).SetMobilityCommand(mc);
           rc.SetCommand(cbc);
         } else {
-          // Hold: use current encoder position (target_position may be 0 before first cmd)
+          // Hold: Python new_core_main.py와 동일하게 target_position 사용
+          // target_position이 모두 0이면(아직 미설정) 실제 encoder position 사용
           Eigen::VectorXd qh(kNumBody);
-          for (int i = 0; i < kNumBody; ++i) qh[i] = rs->position[kNumWheel+i];
+          double tp_norm = 0.;
+          for (int i = 0; i < kNumBody; ++i)
+            tp_norm += rs->target_position[kNumWheel+i] * rs->target_position[kNumWheel+i];
+          if (tp_norm > 1e-6) {
+            for (int i = 0; i < kNumBody; ++i) qh[i] = rs->target_position[kNumWheel+i];
+          } else {
+            // target_position이 0인 경우 실제 encoder position 사용
+            for (int i = 0; i < kNumBody; ++i) qh[i] = rs->position[kNumWheel+i];
+          }
           JointPositionCommandBuilder hold;
           hold.SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*30))
               .SetPosition(qh).SetMinimumTime(kStreamDt*10);
@@ -421,30 +437,24 @@ class Rby1RtNode : public rclcpp::Node {
       }
 
       if (stream_ && stream_->IsDone()) {
-        RCLCPP_ERROR(get_logger(), "stream died before SendCommand (OnDone fired late)");
+        auto cms2 = robot_->GetControlManagerState();
+        RCLCPP_ERROR(get_logger(), "stream died before SendCommand: cms=%s",
+                     rb::to_string(cms2.state).c_str());
         stream_enabled_ = false;
         stream_->Cancel(); stream_.reset();
         ctrl_jp_.enabled = ctrl_jip_.enabled = false;
-        if (robot_) {
-          auto cms2 = robot_->GetControlManagerState();
-          RCLCPP_ERROR(get_logger(), "cms after stream death: %s",
-                       rb::to_string(cms2.state).c_str());
-        }
         sleep_until_abs(next, dt_ns);
         continue;
       }
       try {
         if (stream_) stream_->SendCommand(rc);
       } catch (const std::exception& e) {
-        RCLCPP_ERROR(get_logger(), "stream expired: %s", e.what());
+        auto cms2 = robot_->GetControlManagerState();
+        RCLCPP_ERROR(get_logger(), "stream SendCommand threw: %s | cms=%s",
+                     e.what(), rb::to_string(cms2.state).c_str());
         stream_enabled_ = false;
         if (stream_) { stream_->Cancel(); stream_.reset(); }
         ctrl_jp_.enabled = ctrl_jip_.enabled = false;
-        if (robot_) {
-          auto cms2 = robot_->GetControlManagerState();
-          RCLCPP_ERROR(get_logger(), "cms after stream expired: %s",
-                       rb::to_string(cms2.state).c_str());
-        }
       }
       sleep_until_abs(next, dt_ns);
     }
@@ -590,21 +600,21 @@ class Rby1RtNode : public rclcpp::Node {
     auto cms = robot_->GetControlManagerState();
     RCLCPP_INFO(get_logger(), "cmd_stream_start: cms=%s", rb::to_string(cms.state).c_str());
     if (cms.state != ControlManagerState::State::kEnabled) return false;
+
+    // Python new_core_main.py와 동일한 방식:
+    // create_command_stream() 후 즉시 stream_enabled = True 설정, 별도 대기 없음
+    // stream_loop가 첫 hold 명령을 담당 (Python stream_thread와 동일)
     stream_ = robot_->CreateCommandStream();
-    // Python new_core_main.py 방식: stream 생성 후 즉시 명령 보내지 않음
-    // 펌웨어가 준비되기 전에 명령을 보내면 MajorFault 유발 가능
-    // stream_loop의 fallback hold가 첫 명령을 담당
-    // 단, 50ms 대기 후 stream이 이미 죽었는지 확인
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     if (stream_->IsDone()) {
       auto cms2 = robot_->GetControlManagerState();
-      RCLCPP_ERROR(get_logger(), "stream closed during 50ms wait: cms=%s",
+      RCLCPP_ERROR(get_logger(), "stream already closed at creation: cms=%s",
                    rb::to_string(cms2.state).c_str());
       stream_.reset();
       return false;
     }
     { std::lock_guard<std::mutex> lk(ctr_type_mtx_); ctr_type_ = type; }
     stream_enabled_ = true;
+    RCLCPP_INFO(get_logger(), "cmd_stream_start: stream created, enabled");
     return true;
   }
   bool cmd_stream_stop() {
