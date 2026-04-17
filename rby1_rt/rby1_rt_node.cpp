@@ -335,8 +335,6 @@ class Rby1RtNode : public rclcpp::Node {
   std::mutex  command_mtx_;
   std::chrono::steady_clock::time_point stream_started_at_{};
   std::chrono::steady_clock::time_point last_blocking_command_done_at_{std::chrono::steady_clock::now()};
-  bool stream_first_send_logged_{false};
-  uint64_t stream_send_count_{0};
 
   JointTeleopController          ctrl_jp_;
   JointImpedanceTeleopController ctrl_jip_;
@@ -370,7 +368,6 @@ class Rby1RtNode : public rclcpp::Node {
       }
       if (was_disabled) {
         RCLCPP_INFO(get_logger(), "stream_loop: first tick after enable");
-        stream_first_send_logged_ = false;
         was_disabled = false;
       }
 
@@ -456,23 +453,7 @@ class Rby1RtNode : public rclcpp::Node {
         continue;
       }
       try {
-        if (!stream_first_send_logged_) {
-          RCLCPP_WARN(get_logger(), "stream debug: about to send first command");
-        }
-        if (stream_) {
-          auto fb = stream_->SendCommand(rc);
-          stream_send_count_++;
-          if (!stream_first_send_logged_) {
-            RCLCPP_WARN(get_logger(), "stream debug: first command feedback finish_code=%d send_count=%llu",
-                        static_cast<int>(fb.finish_code()),
-                        static_cast<unsigned long long>(stream_send_count_));
-            stream_first_send_logged_ = true;
-          } else if (stream_send_count_ % 10 == 0) {
-            RCLCPP_INFO(get_logger(), "stream debug: send_count=%llu finish_code=%d",
-                        static_cast<unsigned long long>(stream_send_count_),
-                        static_cast<int>(fb.finish_code()));
-          }
-        }
+        if (stream_) stream_->SendCommand(rc);
       } catch (const std::exception& e) {
         auto cms2 = robot_->GetControlManagerState();
         RCLCPP_ERROR(get_logger(), "stream SendCommand threw: %s | cms=%s",
@@ -489,6 +470,7 @@ class Rby1RtNode : public rclcpp::Node {
 
     sensor_msgs::msg::JointState jmsg;
     jmsg.header.stamp = get_clock()->now();
+    for (const auto& n : ModelType::kRobotJointNames) jmsg.name.push_back(std::string(n));
     for (double v : rs.position) jmsg.position.push_back(v);
     for (double v : rs.velocity) jmsg.velocity.push_back(v);
     for (double v : rs.torque)   jmsg.effort.push_back(v);
@@ -567,8 +549,6 @@ class Rby1RtNode : public rclcpp::Node {
     }
     ctrl_jp_.enabled = false;
     ctrl_jip_.enabled = false;
-    stream_first_send_logged_ = false;
-    stream_send_count_ = 0;
   }
 
   bool wait_for_stream_start_window(std::chrono::milliseconds timeout = std::chrono::milliseconds(3000)) {
@@ -739,8 +719,6 @@ class Rby1RtNode : public rclcpp::Node {
     { std::lock_guard<std::mutex> lk(ctr_type_mtx_); ctr_type_ = type; }
     stream_started_at_ = std::chrono::steady_clock::now();
     stream_enabled_ = true;
-    stream_first_send_logged_ = false;
-    stream_send_count_ = 0;
     RCLCPP_INFO(get_logger(), "cmd_stream_start: stream created, ctr_type=%s", type.c_str());
     return true;
   }
