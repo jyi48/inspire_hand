@@ -1,18 +1,14 @@
 /**
  * rby1_rt_node.cpp
  *
- * C++ ROS2 node replacing new_core_main.py with improved real-time performance.
+ * ROS2 real-time control node for RB-Y1.
+ *   - StartStateUpdate callback: robot state fetch decoupled from control loop
+ *   - clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME): µs-precision loop timing
+ *   - pthread_setschedparam(SCHED_FIFO, 80): RT thread priority (needs CAP_SYS_NICE)
  *
- * Improvements over Python:
- *   1. StartStateUpdate callback — robot state fetch decoupled from control loop
- *   2. clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME) — µs-precision loop timing
- *   3. pthread_setschedparam(SCHED_FIFO, 80) — RT thread priority (needs CAP_SYS_NICE)
- *   4. No GC / GIL pauses
- *
- * Compatible with small_main.py:
- *   - All /rby1_command action strings handled
- *   - /rby1_status JSON matches small_main parse keys
- *   - /rby1_status_joint, /rby1_teleop_command, /rby1_impedance_teleop_command
+ * Build targets (CMakeLists.txt):
+ *   rby1_rt_node   — model A (differential 2-wheel)
+ *   rby1_rt_node_m — model M (mecanum 4-wheel, -DUSE_MODEL_M)
  */
 
 #include <pthread.h>
@@ -99,8 +95,7 @@ struct JointTeleopController {
 
   std::array<double, kNumBody> q{}, q_filtered{};
   std::array<double, kNumBody> max_q{}, min_q{}, max_dq{}, max_ddq{};
-  // cmd_array: q20 포맷 호환 [torso(6), rarm(7), larm(7), gripper(2)] = 22
-  // torso(0..5)는 현재 미사용 — 추후 torso teleop 시 compute()에서 읽으면 됨
+  // cmd_array: [torso(6), rarm(7), larm(7), gripper(2)] = 22
   std::array<double, 22> cmd_array{};
   double gripper_p_ref[2]{0.5, 0.5};
   double gripper_ref[2]{0., 0.};
@@ -172,7 +167,7 @@ struct JointImpedanceTeleopController {
 
   std::array<double, kNumBody> q{}, q_filtered{};
   std::array<double, kNumBody> max_q{}, min_q{};
-  // cmd_array: q20 포맷 호환 [torso(6), rarm(7), larm(7), gripper(2)] = 22
+  // cmd_array: [torso(6), rarm(7), larm(7), gripper(2)] = 22
   std::array<double, 22> cmd_array{};
   double gripper_p_ref[2]{0., 0.};
   double gripper_ref[2]{0., 0.};
@@ -333,7 +328,6 @@ class Rby1RtNode : public rclcpp::Node {
   std::string ctr_type_{"JointPosition"};
   std::mutex  ctr_type_mtx_;
   std::mutex  command_mtx_;
-  std::chrono::steady_clock::time_point stream_started_at_{};
   std::chrono::steady_clock::time_point last_blocking_command_done_at_{std::chrono::steady_clock::now()};
 
   JointTeleopController          ctrl_jp_;
@@ -357,7 +351,7 @@ class Rby1RtNode : public rclcpp::Node {
     clock_gettime(CLOCK_MONOTONIC, &next);
     const long dt_ns = static_cast<long>(kStreamDt * 1e9);
 
-    bool was_disabled = true;  // 첫 진입 타이밍 측정용
+    bool was_disabled = true;
 
     while (rclcpp::ok()) {
       if (!stream_enabled_) {
@@ -405,7 +399,6 @@ class Rby1RtNode : public rclcpp::Node {
         bool has_new = ctrl_jp_.compute(*rs, *dyn_, dyn_state_, kStreamDt);
         BodyComponentBasedCommandBuilder bc;
         if (has_new) {
-          // 새 명령: IK에서 필터링/클램핑된 팔 각도 사용 (BodyComponentBased, mobility 없음)
           Eigen::Map<Eigen::VectorXd> ra(ctrl_jp_.q_filtered.data() + 6, 7);
           Eigen::Map<Eigen::VectorXd> la(ctrl_jp_.q_filtered.data() + 13, 7);
           bc.SetRightArmCommand(
@@ -417,7 +410,7 @@ class Rby1RtNode : public rclcpp::Node {
                     .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*30))
                     .SetPosition(la).SetMinimumTime(kStreamDt*2));
         } else {
-          // Hold: BodyComponentBased arms-only (MajorFault 없이 확인된 패턴)
+          // Hold
           Eigen::Map<Eigen::VectorXd> ra(qh.data() + 6, 7);
           Eigen::Map<Eigen::VectorXd> la(qh.data() + 13, 7);
           bc.SetRightArmCommand(
@@ -705,9 +698,6 @@ class Rby1RtNode : public rclcpp::Node {
       return false;
     }
 
-    // Python new_core_main.py와 동일한 방식:
-    // create_command_stream() 후 즉시 stream_enabled = True 설정, 별도 대기 없음
-    // stream_loop가 첫 hold 명령을 담당 (Python stream_thread와 동일)
     stream_ = robot_->CreateCommandStream();
     if (stream_->IsDone()) {
       auto cms2 = robot_->GetControlManagerState();
@@ -717,7 +707,6 @@ class Rby1RtNode : public rclcpp::Node {
       return false;
     }
     { std::lock_guard<std::mutex> lk(ctr_type_mtx_); ctr_type_ = type; }
-    stream_started_at_ = std::chrono::steady_clock::now();
     stream_enabled_ = true;
     RCLCPP_INFO(get_logger(), "cmd_stream_start: stream created, ctr_type=%s", type.c_str());
     return true;
