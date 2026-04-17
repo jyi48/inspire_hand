@@ -324,6 +324,7 @@ class Rby1RtNode : public rclcpp::Node {
   std::atomic<bool> no_gripper_{true};
   std::atomic<bool> power_on_{false};
   std::atomic<bool> servo_on_{false};
+  std::atomic<int>  cached_cms_state_{0};  // ControlManagerState::State (on_state 콜백에서 갱신)
 
   std::string ctr_type_{"JointPosition"};
   std::mutex  ctr_type_mtx_;
@@ -438,9 +439,8 @@ class Rby1RtNode : public rclcpp::Node {
       }
 
       if (stream_ && stream_->IsDone()) {
-        auto cms2 = robot_->GetControlManagerState();
         RCLCPP_ERROR(get_logger(), "stream died before SendCommand: cms=%s",
-                     rb::to_string(cms2.state).c_str());
+                     rb::to_string(cms_state()).c_str());
         cleanup_stream("stream died before SendCommand");
         sleep_until_abs(next, dt_ns);
         continue;
@@ -448,9 +448,8 @@ class Rby1RtNode : public rclcpp::Node {
       try {
         if (stream_) stream_->SendCommand(rc);
       } catch (const std::exception& e) {
-        auto cms2 = robot_->GetControlManagerState();
         RCLCPP_ERROR(get_logger(), "stream SendCommand threw: %s | cms=%s",
-                     e.what(), rb::to_string(cms2.state).c_str());
+                     e.what(), rb::to_string(cms_state()).c_str());
         cleanup_stream("stream SendCommand threw");
       }
       sleep_until_abs(next, dt_ns);
@@ -459,6 +458,7 @@ class Rby1RtNode : public rclcpp::Node {
 
   // ── State update callback (SDK thread, ~50 Hz) ───────────────────────────
   void on_state(const RobotState<ModelType>& rs, const ControlManagerState& cms) {
+    cached_cms_state_ = static_cast<int>(cms.state);
     { std::lock_guard<std::mutex> lk(state_mtx_); cached_state_ = std::make_shared<RobotState<ModelType>>(rs); }
 
     sensor_msgs::msg::JointState jmsg;
@@ -531,10 +531,13 @@ class Rby1RtNode : public rclcpp::Node {
   // ── SDK helpers ──────────────────────────────────────────────────────────
   bool check() const { return robot_ && robot_->IsConnected(); }
 
+  ControlManagerState::State cms_state() const {
+    return static_cast<ControlManagerState::State>(cached_cms_state_.load());
+  }
+
   void cleanup_stream(const char* reason) {
-    auto cms = robot_ ? robot_->GetControlManagerState() : ControlManagerState{};
     RCLCPP_WARN(get_logger(), "cleanup_stream: %s | cms=%s",
-                reason, rb::to_string(cms.state).c_str());
+                reason, rb::to_string(cms_state()).c_str());
     stream_enabled_ = false;
     if (stream_) {
       stream_->Cancel();
@@ -549,8 +552,7 @@ class Rby1RtNode : public rclcpp::Node {
     int settled_samples = 0;
 
     while (std::chrono::steady_clock::now() < deadline && rclcpp::ok()) {
-      auto cms = robot_->GetControlManagerState();
-      if (cms.state != ControlManagerState::State::kEnabled) {
+      if (cms_state() != ControlManagerState::State::kEnabled) {
         settled_samples = 0;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         continue;
@@ -655,9 +657,9 @@ class Rby1RtNode : public rclcpp::Node {
   }
   bool cmd_error_reset() {
     if (!check()) return false;
-    auto s = robot_->GetControlManagerState();
-    if (s.state == ControlManagerState::State::kMajorFault ||
-        s.state == ControlManagerState::State::kMinorFault)
+    auto s = cms_state();
+    if (s == ControlManagerState::State::kMajorFault ||
+        s == ControlManagerState::State::kMinorFault)
       return robot_->ResetFaultControlManager();
     return true;
   }
@@ -673,16 +675,16 @@ class Rby1RtNode : public rclcpp::Node {
   }
   bool cmd_stream_start(const std::string& type) {
     if (!check() || !robot_ok_ || stream_enabled_) return false;
-    auto cms = robot_->GetControlManagerState();
-    RCLCPP_INFO(get_logger(), "cmd_stream_start: cms=%s", rb::to_string(cms.state).c_str());
-    if (cms.state == ControlManagerState::State::kMajorFault ||
-        cms.state == ControlManagerState::State::kMinorFault) {
-      RCLCPP_ERROR(get_logger(), "cmd_stream_start: control manager faulted before stream start: cms=%s",
-                   rb::to_string(cms.state).c_str());
+    auto cs = cms_state();
+    RCLCPP_INFO(get_logger(), "cmd_stream_start: cms=%s", rb::to_string(cs).c_str());
+    if (cs == ControlManagerState::State::kMajorFault ||
+        cs == ControlManagerState::State::kMinorFault) {
+      RCLCPP_ERROR(get_logger(), "cmd_stream_start: control manager faulted: cms=%s",
+                   rb::to_string(cs).c_str());
       cleanup_stream("faulted before stream start");
       return false;
     }
-    if (cms.state != ControlManagerState::State::kEnabled) return false;
+    if (cs != ControlManagerState::State::kEnabled) return false;
     const auto since_blocking_done =
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - last_blocking_command_done_at_);
@@ -700,9 +702,8 @@ class Rby1RtNode : public rclcpp::Node {
 
     stream_ = robot_->CreateCommandStream();
     if (stream_->IsDone()) {
-      auto cms2 = robot_->GetControlManagerState();
       RCLCPP_ERROR(get_logger(), "stream already closed at creation: cms=%s",
-                   rb::to_string(cms2.state).c_str());
+                   rb::to_string(cms_state()).c_str());
       cleanup_stream("stream already closed at creation");
       return false;
     }
