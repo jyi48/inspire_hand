@@ -84,6 +84,14 @@ static std::vector<std::string> split(const std::string& s, char delim) {
   return out;
 }
 
+static Eigen::Matrix4d pose_to_matrix(const geometry_msgs::msg::Pose& p) {
+  Eigen::Quaterniond q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
+  Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+  T.block<3,3>(0,0) = q.toRotationMatrix();
+  T.block<3,1>(0,3) = Eigen::Vector3d(p.position.x, p.position.y, p.position.z);
+  return T;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Joint Position Teleop Controller
 // ─────────────────────────────────────────────────────────────────────────────
@@ -266,6 +274,19 @@ struct JointImpedanceTeleopController {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Cartesian Teleop Controller (SDK IK)
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct CartesianTeleopController {
+  bool enabled{false};
+  bool new_cmd{false};
+  int  traj_dt_cnt{0};
+  Eigen::Matrix4d T_right{Eigen::Matrix4d::Identity()};
+  Eigen::Matrix4d T_left{Eigen::Matrix4d::Identity()};
+  std::mutex mtx;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Main Node
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -286,9 +307,15 @@ class Rby1RtNode : public rclcpp::Node {
     sub_imp_teleop_ = create_subscription<interbotix_xs_msgs::msg::JointGroupCommand>(
         "/rby1_impedance_teleop_command", 2,
         [this](const interbotix_xs_msgs::msg::JointGroupCommand::SharedPtr m){ ctrl_jip_.on_msg(m); });
-    sub_pink_teleop_ = create_subscription<geometry_msgs::msg::PoseArray>(
-        "/rby1_pink_teleop_command", 2,
-        [this](const geometry_msgs::msg::PoseArray::SharedPtr){ /* TODO: pink IK */ });
+    sub_sdk_teleop_ = create_subscription<geometry_msgs::msg::PoseArray>(
+        "/rby1_sdk_teleop_command", 2,
+        [this](const geometry_msgs::msg::PoseArray::SharedPtr m) {
+          if (m->poses.size() < 2) return;
+          std::lock_guard<std::mutex> lk(ctrl_sdk_.mtx);
+          ctrl_sdk_.T_right = pose_to_matrix(m->poses[0]);
+          ctrl_sdk_.T_left  = pose_to_matrix(m->poses[1]);
+          ctrl_sdk_.new_cmd = true;
+        });
 
     pub_status_ = create_publisher<std_msgs::msg::String>("/rby1_status", 2);
     pub_joints_ = create_publisher<sensor_msgs::msg::JointState>("/rby1_status_joint", 2);
@@ -325,6 +352,7 @@ class Rby1RtNode : public rclcpp::Node {
   std::atomic<bool> power_on_{false};
   std::atomic<bool> servo_on_{false};
   std::atomic<int>  cached_cms_state_{0};  // ControlManagerState::State (on_state 콜백에서 갱신)
+  std::atomic<bool> self_collision_stop_{false};
 
   std::string ctr_type_{"JointPosition"};
   std::mutex  ctr_type_mtx_;
@@ -332,13 +360,14 @@ class Rby1RtNode : public rclcpp::Node {
 
   JointTeleopController          ctrl_jp_;
   JointImpedanceTeleopController ctrl_jip_;
+  CartesianTeleopController      ctrl_sdk_;
 
   double x_speed_{0.}, y_speed_{0.}, yaw_speed_{0.};
   int    base_cnt_{0};
 
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr sub_base_vel_;
   rclcpp::Subscription<interbotix_xs_msgs::msg::JointGroupCommand>::SharedPtr sub_teleop_, sub_imp_teleop_;
-  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr sub_pink_teleop_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr sub_sdk_teleop_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_status_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pub_joints_;
   rclcpp_action::Server<Rby1Command>::SharedPtr action_server_;
@@ -363,6 +392,13 @@ class Rby1RtNode : public rclcpp::Node {
       if (was_disabled) {
         RCLCPP_INFO(get_logger(), "stream_loop: first tick after enable");
         was_disabled = false;
+      }
+
+      if (self_collision_stop_.exchange(false)) {
+        RCLCPP_ERROR(get_logger(), "Self-collision detected — stopping SDK stream");
+        cleanup_stream("self-collision detected");
+        sleep_until_abs(next, dt_ns);
+        continue;
       }
 
       std::shared_ptr<const RobotState<ModelType>> rs;
@@ -431,6 +467,93 @@ class Rby1RtNode : public rclcpp::Node {
         ComponentBasedCommandBuilder cbc;
         cbc.SetBodyCommand(has_new ? bc_active : bc_hold).SetMobilityCommand(mc);
         rc.SetCommand(cbc);
+      } else if (ctr == "CartesianPosition") {
+        Eigen::Matrix4d T_r, T_l;
+        bool has_new = false;
+        {
+          std::lock_guard<std::mutex> lk(ctrl_sdk_.mtx);
+          T_r = ctrl_sdk_.T_right;
+          T_l = ctrl_sdk_.T_left;
+          has_new = ctrl_sdk_.new_cmd;
+          ctrl_sdk_.new_cmd = false;
+        }
+        BodyComponentBasedCommandBuilder bc;
+        if (ctrl_sdk_.traj_dt_cnt == 0 && !has_new) {
+          // 첫 Cartesian 명령 오기 전: 현재 joint 위치 유지
+          Eigen::VectorXd qh(kNumBody);
+          double tp_norm = 0.;
+          for (int i = 0; i < kNumBody; ++i)
+            tp_norm += rs->target_position[kNumWheel+i] * rs->target_position[kNumWheel+i];
+          for (int i = 0; i < kNumBody; ++i)
+            qh[i] = (tp_norm > 1e-6) ? rs->target_position[kNumWheel+i] : rs->position[kNumWheel+i];
+          Eigen::Map<Eigen::VectorXd> ra(qh.data()+6, 7);
+          Eigen::Map<Eigen::VectorXd> la(qh.data()+13, 7);
+          bc.SetRightArmCommand(JointPositionCommandBuilder()
+              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
+              .SetPosition(ra).SetMinimumTime(0.2))
+            .SetLeftArmCommand(JointPositionCommandBuilder()
+              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
+              .SetPosition(la).SetMinimumTime(0.2));
+        } else {
+          if (has_new) ctrl_sdk_.traj_dt_cnt++;
+          double hold_t = has_new ? kStreamDt*30 : 3.0;
+          double vel_l  = has_new ? 0.5 : 0.05;
+          double vel_a  = has_new ? 3.0 : 0.5;
+          bc.SetRightArmCommand(CartesianCommandBuilder()
+              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(hold_t))
+              .AddTarget("base", "ee_right", T_r, vel_l, vel_a))
+            .SetLeftArmCommand(CartesianCommandBuilder()
+              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(hold_t))
+              .AddTarget("base", "ee_left", T_l, vel_l, vel_a));
+        }
+        ComponentBasedCommandBuilder cbc;
+        cbc.SetBodyCommand(bc).SetMobilityCommand(mc);
+        rc.SetCommand(cbc);
+      } else if (ctr == "CartesianImpedance") {
+        Eigen::Matrix4d T_r, T_l;
+        bool has_new = false;
+        {
+          std::lock_guard<std::mutex> lk(ctrl_sdk_.mtx);
+          T_r = ctrl_sdk_.T_right;
+          T_l = ctrl_sdk_.T_left;
+          has_new = ctrl_sdk_.new_cmd;
+          ctrl_sdk_.new_cmd = false;
+        }
+        BodyComponentBasedCommandBuilder bc;
+        if (ctrl_sdk_.traj_dt_cnt == 0 && !has_new) {
+          Eigen::VectorXd qh(kNumBody);
+          double tp_norm = 0.;
+          for (int i = 0; i < kNumBody; ++i)
+            tp_norm += rs->target_position[kNumWheel+i] * rs->target_position[kNumWheel+i];
+          for (int i = 0; i < kNumBody; ++i)
+            qh[i] = (tp_norm > 1e-6) ? rs->target_position[kNumWheel+i] : rs->position[kNumWheel+i];
+          Eigen::Map<Eigen::VectorXd> ra(qh.data()+6, 7);
+          Eigen::Map<Eigen::VectorXd> la(qh.data()+13, 7);
+          bc.SetRightArmCommand(JointPositionCommandBuilder()
+              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
+              .SetPosition(ra).SetMinimumTime(0.2))
+            .SetLeftArmCommand(JointPositionCommandBuilder()
+              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
+              .SetPosition(la).SetMinimumTime(0.2));
+        } else {
+          if (has_new) ctrl_sdk_.traj_dt_cnt++;
+          const Eigen::VectorXd q_ready = build_ready_q();
+          const Eigen::VectorXd q_ns_r  = q_ready.segment(6, 7);
+          const Eigen::VectorXd q_ns_l  = q_ready.segment(13, 7);
+          Eigen::VectorXd ns_w = Eigen::VectorXd::Ones(7);
+          ns_w[1] = 5.0;  // shoulder roll — self-collision bias
+          bc.SetRightArmCommand(CartesianImpedanceControlCommandBuilder()
+              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*30))
+              .AddTarget("base", "ee_right", T_r, 0.5, 3.0)
+              .SetNullspaceJointTarget(q_ns_r, ns_w))
+            .SetLeftArmCommand(CartesianImpedanceControlCommandBuilder()
+              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*30))
+              .AddTarget("base", "ee_left", T_l, 0.5, 3.0)
+              .SetNullspaceJointTarget(q_ns_l, ns_w));
+        }
+        ComponentBasedCommandBuilder cbc;
+        cbc.SetBodyCommand(bc).SetMobilityCommand(mc);
+        rc.SetCommand(cbc);
       } else {
         RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000, "Unknown ctr_type: %s", ctr.c_str());
         sleep_until_abs(next, dt_ns);
@@ -490,6 +613,19 @@ class Rby1RtNode : public rclcpp::Node {
     std_msgs::msg::String smsg;
     smsg.data = json.str();
     pub_status_->publish(smsg);
+
+    if (stream_enabled_ &&
+        (ctr_snap == "CartesianPosition" || ctr_snap == "CartesianImpedance")) {
+      for (const auto& col : rs.collisions) {
+        if (col.distance < 0.0) {
+          RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000,
+              "Self-collision: %s <-> %s dist=%.4f",
+              col.link1.c_str(), col.link2.c_str(), col.distance);
+          self_collision_stop_ = true;
+          break;
+        }
+      }
+    }
   }
 
   // ── Command dispatch ─────────────────────────────────────────────────────
@@ -512,9 +648,11 @@ class Rby1RtNode : public rclcpp::Node {
     else if (parts[0] == "stop_move")              ok = stop_move();
     else if (parts[0] == "stream_start")           ok = cmd_stream_start(parts.size() > 1 ? parts[1] : "JointPosition");
     else if (parts[0] == "stream_stop")            ok = cmd_stream_stop();
-    else if (parts[0] == "teleop_start")           ok = cmd_teleop_start();
-    else if (parts[0] == "impedance_teleop_start") ok = cmd_impedance_teleop_start();
-    else if (parts[0] == "teleop_pink_start")      ok = cmd_teleop_start();
+    else if (parts[0] == "teleop_start")               ok = cmd_teleop_start();
+    else if (parts[0] == "impedance_teleop_start")     ok = cmd_impedance_teleop_start();
+    else if (parts[0] == "sdk_position_teleop_start")  ok = cmd_sdk_position_teleop_start();
+    else if (parts[0] == "sdk_impedance_teleop_start") ok = cmd_sdk_impedance_teleop_start();
+    else if (parts[0] == "teleop_pink_start")          ok = cmd_teleop_start();
     else if (parts[0] == "teleop_stop")            ok = cmd_teleop_stop();
     else if (parts[0] == "zero_pose")              ok = cmd_pose(Eigen::VectorXd::Zero(kNumBody));
     else if (parts[0] == "ready_pose")             ok = cmd_pose(build_ready_q());
@@ -542,8 +680,9 @@ class Rby1RtNode : public rclcpp::Node {
       stream_->Cancel();
       stream_.reset();
     }
-    ctrl_jp_.enabled = false;
+    ctrl_jp_.enabled  = false;
     ctrl_jip_.enabled = false;
+    ctrl_sdk_.enabled = false;
   }
 
   bool wait_for_stream_start_window(std::chrono::milliseconds timeout = std::chrono::milliseconds(3000)) {
@@ -717,8 +856,20 @@ class Rby1RtNode : public rclcpp::Node {
     return true;
   }
   bool cmd_teleop_stop() {
-    ctrl_jp_.enabled = ctrl_jip_.enabled = false;
+    ctrl_jp_.enabled = ctrl_jip_.enabled = ctrl_sdk_.enabled = false;
     return cmd_stream_stop();
+  }
+  bool cmd_sdk_position_teleop_start() {
+    if (!cmd_stream_start("CartesianPosition")) return false;
+    std::lock_guard<std::mutex> lk(ctrl_sdk_.mtx);
+    ctrl_sdk_.traj_dt_cnt = 0; ctrl_sdk_.new_cmd = false; ctrl_sdk_.enabled = true;
+    return true;
+  }
+  bool cmd_sdk_impedance_teleop_start() {
+    if (!cmd_stream_start("CartesianImpedance")) return false;
+    std::lock_guard<std::mutex> lk(ctrl_sdk_.mtx);
+    ctrl_sdk_.traj_dt_cnt = 0; ctrl_sdk_.new_cmd = false; ctrl_sdk_.enabled = true;
+    return true;
   }
   bool cmd_pose(const Eigen::VectorXd& q, double t = 5.) {
     if (!check() || !robot_ok_) return false;
